@@ -1,0 +1,5 @@
+model: {latent_dim: 8, hidden_dim: 32, layers: 1, heads: 4, mlp_ratio: 2, dropout: 0.0, zero_init_output: false}
+conditioning: {num_datasets: 2, num_tasks: 2, num_styles: 4, num_genres: 6, num_emotions: 11, embedding_dim: 32}
+diffusion: {train_timesteps: 20, schedule: cosine, prediction_type: epsilon, eta: 0.0}
+solver: {num_steps: 4}
+training: {batch_size: 2, max_steps: 2, precision: fp32}

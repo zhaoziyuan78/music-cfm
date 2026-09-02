@@ -1,0 +1,8 @@
+type: descriptor_mlp
+hidden_layers: [256, 128]
+max_iter: 200
+min_iter: 20
+early_stopping_patience: 10
+early_stopping_tolerance: 0.0001
+checkpoint_interval: 25
+random_state: 0

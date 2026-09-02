@@ -1,0 +1,62 @@
+defaults:
+  - paths: default
+  - download: default
+  - data: xmidi
+  - tokenizer: beat
+  - codec: transformer_vae
+  - transport: cfm
+  - independence: none
+  - evaluator: transformer
+  - experiment: e20_cfm_base
+  - _self_
+
+seed: 0
+datasets: [xmidi]
+codec_checkpoint: null
+transport_checkpoint: null
+evaluator_checkpoint: null
+resume: false
+resume_from: null
+task: genre
+preprocessing:
+  workers: 0  # auto: min(8, CPUs available to this job)
+  worker_chunksize: 32
+latent_cache:
+  samples_per_shard: 8192
+  dtype: float16
+  # Encoder-only inference saturates an A100 40G near this point while
+  # retaining ample headroom for variable-length batches and CUDA workspaces.
+  batch_size_per_gpu: 384
+  codec_weights: raw
+  verify_after_write: false
+  dataloader_workers: 32  # total across all torchrun ranks
+  prefetch_factor: 4
+  midi_cache_size: 16
+counterfactual:
+  # EMA is markedly more stable than the instantaneous weights under ODE inversion.
+  transport_weights: ema
+  target_policy: all_other
+  explicit_pairs: []
+  # Ten unique songs per source style and five targets produce at most 300
+  # ordered XMIDI transitions, instead of scanning every cached segment.
+  targets_per_source: 5
+  max_sources_per_style: 10
+  max_total_sources: 60
+  unique_sources: true
+  skip_existing: true
+  target_batch_size: 8
+  decode_batch_size: 8
+  decode_length_multiplier: 1.1
+  show_decode_progress: true
+  deterministic_decode: true
+  factorial_intervention: genre
+report:
+  experiments: []
+license:
+  accept: false
+  acknowledge_unknown: false
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.runs_dir}/${experiment.name}/${now:%Y-%m-%d_%H-%M-%S}

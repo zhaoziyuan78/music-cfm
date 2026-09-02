@@ -1,0 +1,40 @@
+type: transformer_vae
+vocab_size: auto
+d_model: 768
+encoder_layers: 12
+decoder_layers: 12
+num_heads: 12
+ff_multiplier: 4
+dropout: 0.05
+latent_tokens: 64
+latent_dim: 512
+max_sequence_length: 2560
+posterior: diagonal_gaussian
+use_learned_latent_queries: true
+deterministic_transport_encoding: posterior_mean
+kl: {schedule: linear_warmup, warmup_steps: 20000, beta_max: 0.0001, free_bits_per_dim: 0.05}
+training:
+  seed: 0
+  batch_size: 32
+  gradient_accumulation: 1
+  gradient_checkpointing: true
+  decoder_token_dropout: 0.15
+  length_bucketing: true
+  drop_overlength: true
+  dataloader_workers: 8
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  max_steps: 100000
+  max_epochs: 8
+  warmup_steps: 5000
+  gradient_clip_norm: 1.0
+  precision: bf16
+  ema: {enabled: true, decay: 0.999}
+  checkpoint_interval: 1000
+  validation_interval: 1000
+  validation_samples: 256
+  validation_generation_samples: 4
+  validation_generation_max_length: 2560
+inference: {batch_size: 8, precision: bf16}
+codec_scope: {mode: per_dataset}

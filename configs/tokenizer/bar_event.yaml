@@ -1,0 +1,14 @@
+type: bar_event
+steps_per_beat: 4
+velocity_bins: 32
+tempo_bins: 32
+tempo_min: 30
+tempo_max: 240
+max_duration_beats: 16
+program_mode: gm_family_16
+include_program: true
+include_velocity: true
+include_tempo: true
+include_time_signature: true
+include_drum_pitch: true
+max_sequence_length: 2048

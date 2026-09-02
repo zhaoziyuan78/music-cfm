@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - override /data: groove
+  - override /codec: drum_transformer_vae
+  - override /transport: cfm
+  - override /independence: exoreg
+experiment: {name: e33_groove_cfm, stage: abduction}
+task: style
+# Groove retains its independently trained 32 x 256 drum latent.
+transport:
+  model: {latent_dim: 256}

@@ -1,0 +1,12 @@
+project_root: ${oc.env:CFMUSIC_PROJECT_ROOT,${hydra:runtime.cwd}}
+data_root: ${oc.env:CFMUSIC_DATA_ROOT,${paths.project_root}/data}
+raw_dir: ${oc.env:CFMUSIC_RAW_DIR,${paths.data_root}/raw}
+processed_dir: ${oc.env:CFMUSIC_PROCESSED_DIR,${paths.data_root}/processed}
+index_dir: ${oc.env:CFMUSIC_INDEX_DIR,${paths.data_root}/index}
+latent_dir: ${oc.env:CFMUSIC_LATENT_DIR,${paths.data_root}/latents}
+cache_dir: ${oc.env:CFMUSIC_CACHE_DIR,${paths.data_root}/cache}
+tmp_dir: ${oc.env:CFMUSIC_TMP_DIR,${paths.data_root}/tmp}
+runs_dir: ${oc.env:CFMUSIC_RUNS_DIR,${paths.data_root}/../runs}
+checkpoints_dir: ${oc.env:CFMUSIC_CHECKPOINTS_DIR,${paths.data_root}/../checkpoints}
+artifacts_dir: ${oc.env:CFMUSIC_ARTIFACTS_DIR,${paths.data_root}/../artifacts}
+reports_dir: ${oc.env:CFMUSIC_REPORTS_DIR,${paths.project_root}/reports}

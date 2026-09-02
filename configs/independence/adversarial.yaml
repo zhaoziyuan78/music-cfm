@@ -1,0 +1,10 @@
+enabled: true
+hsic_weight: 0.0
+prior_weight: 0.0
+adversarial_weight: 0.001
+warmup_steps: 500
+ramp_steps: 2000
+noise_projection: {dim: 128, seed: 2026}
+roundtrip: {weight: 0.1, cosine_weight: 0.1}
+sampler: {type: balanced_style, classes_per_batch: 4, samples_per_class: 16, replacement_for_small_classes: true}
+training: {max_steps: 12000, learning_rate: 0.00002, abduction_interval: 4, train_inverse_steps: 4, gradient_checkpointing: false, checkpoint_interval: 1000, precision: bf16, sdpa_backend: math, gradient_clip_norm: 1.0, dataloader_workers: 2, prefetch_factor: 2, log_interval: 10, ema_update_interval: 10}

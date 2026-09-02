@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: cfm
+  - override /independence: none
+experiment: {name: e20_cfm_base, stage: transport}

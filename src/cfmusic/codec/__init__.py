@@ -1,0 +1,1 @@
+"""Transformer latent MIDI codec."""

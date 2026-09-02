@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: ddim
+  - override /independence: none
+experiment: {name: e11_ddim_fpi, stage: transport}
+transport:
+  ddim_inversion: {method: fixed_point, iterations: 3, tolerance: 1.0e-5, stop_on_convergence: true}

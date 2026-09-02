@@ -1,0 +1,14 @@
+d_model: 32
+encoder_layers: 1
+decoder_layers: 1
+num_heads: 4
+ff_multiplier: 2
+dropout: 0.0
+latent_tokens: 2
+latent_dim: 8
+max_sequence_length: 128
+training:
+  batch_size: 2
+  gradient_accumulation: 1
+  max_steps: 2
+  precision: fp32

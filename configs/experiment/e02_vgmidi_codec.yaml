@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /data: vgmidi
+  - override /codec: transformer_vae
+  - override /independence: none
+experiment: {name: e02_vgmidi_codec, stage: codec}
+codec:
+  kl: {warmup_steps: 2000}
+  training:
+    max_steps: 20000
+    max_epochs: 200
+    warmup_steps: 500
+    checkpoint_interval: 250
+    validation_interval: 250

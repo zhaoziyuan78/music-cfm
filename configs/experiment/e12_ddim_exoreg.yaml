@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: ddim
+  - override /independence: exoreg
+experiment: {name: e12_ddim_exoreg, stage: abduction}
+transport:
+  ddim_inversion: {method: fixed_point, iterations: 3, tolerance: 1.0e-5, stop_on_convergence: true}

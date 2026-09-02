@@ -1,0 +1,13 @@
+type: beat
+implementation_version: cfmusic-beat-v1
+source: https://github.com/Lekai-Qian/BEAT-code
+source_commit: 1902b46cdd566747021ab6b2032d478bf8ac3508
+vocabulary_size: 593
+steps_per_beat: 4
+preserve_velocity: true
+include_program: true
+include_velocity: true
+include_tempo: true
+include_time_signature: true
+include_drum_pitch: true
+max_sequence_length: 2560

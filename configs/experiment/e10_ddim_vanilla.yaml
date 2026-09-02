@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: ddim
+  - override /independence: none
+experiment: {name: e10_ddim_vanilla, stage: transport}
+transport:
+  ddim_inversion: {method: vanilla}

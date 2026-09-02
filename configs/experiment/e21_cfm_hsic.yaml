@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: cfm
+  - override /independence: hsic
+experiment: {name: e21_cfm_hsic, stage: abduction}

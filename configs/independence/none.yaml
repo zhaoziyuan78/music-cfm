@@ -1,0 +1,9 @@
+enabled: false
+hsic_weight: 0.0
+prior_weight: 0.0
+adversarial_weight: 0.0
+warmup_steps: 0
+ramp_steps: 0
+noise_projection: {dim: 128, seed: 2026}
+roundtrip: {weight: 0.0, cosine_weight: 0.1}
+sampler: {type: random, classes_per_batch: 4, samples_per_class: 16, replacement_for_small_classes: true}

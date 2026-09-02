@@ -1,0 +1,26 @@
+resume: true
+force: false
+dry_run: false
+chunk_size: 1048576
+timeout_seconds: 60
+datasets:
+  xmidi:
+    source: {kind: google_drive, file_id: 1qDkSH31x7jN8X-2RyzB9wuxGji4QxYyA, archive_name: XMIDI_Dataset.zip, expected_sha256: null}
+    official_page: https://github.com/xmusic-project/XMIDI_Dataset
+    license: {name: UNKNOWN_VERIFY_WITH_DATASET_AUTHORS, requires_acknowledgement: true}
+  emopia:
+    source: {kind: muspy, dataset_class: EMOPIADataset}
+    official_page: https://github.com/annahung31/EMOPIA
+    license: {name: CC-BY-NC-SA-4.0, requires_acknowledgement: true, commercial_use: false}
+  vgmidi:
+    source: {kind: git, repository: https://github.com/lucasnfe/vgmidi.git, revision: master, shallow: true}
+    official_page: https://github.com/lucasnfe/vgmidi
+    license: {name: UNKNOWN_VERIFY_WITH_DATASET_AUTHORS, requires_acknowledgement: true}
+  groove:
+    source:
+      kind: http_archive
+      url: https://storage.googleapis.com/magentadata/datasets/groove/groove-v1.0.0-midionly.zip
+      archive_name: groove-v1.0.0-midionly.zip
+      expected_sha256: 651cbc524ffb891be1a3e46d89dc82a1cecb09a57c748c7b45b844c4841dcc1e
+    official_page: https://magenta.withgoogle.com/datasets/groove
+    license: {name: CC-BY-4.0, requires_acknowledgement: true}

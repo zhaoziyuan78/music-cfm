@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - override /data: emotion_4q_union
+  - override /transport: cfm
+  - override /independence: exoreg
+experiment: {name: e60_cross_domain_4q, stage: abduction, multidataset: true}
+task: emotion
+transport:
+  conditioning: {num_datasets: 2, num_styles: 4}

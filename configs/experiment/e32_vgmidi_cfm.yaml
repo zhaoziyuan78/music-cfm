@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+  - override /data: vgmidi
+  - override /transport: cfm
+  - override /independence: exoreg
+experiment: {name: e32_vgmidi_cfm, stage: abduction}
+task: emotion

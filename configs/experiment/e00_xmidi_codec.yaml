@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /codec: transformer_vae
+  - override /independence: none
+experiment: {name: e00_xmidi_codec, stage: codec}

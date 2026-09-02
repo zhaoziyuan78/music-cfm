@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+  - override /data: emopia
+  - override /transport: cfm
+  - override /independence: exoreg
+experiment: {name: e31_emopia_cfm, stage: abduction}
+task: emotion

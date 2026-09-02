@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: cfm
+  - override /independence: none
+experiment: {name: e51_shuffled_labels, stage: transport, shuffled_labels: true, negative_control: shuffled_labels}

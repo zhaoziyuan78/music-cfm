@@ -1,0 +1,11 @@
+name: split_cfm
+type: cfm
+model: {type: latent_dit, latent_dim: 256, hidden_dim: 512, layers: 8, heads: 8, mlp_ratio: 4, dropout: 0.0, condition_injection: adaln, zero_init_output: true, gradient_checkpointing: false}
+conditioning: {num_datasets: 4, num_tasks: 8, num_styles: 32, num_genres: 6, num_emotions: 11, embedding_dim: 512}
+split: {enabled: true, original_latent_dim: 512, editable_fraction: 0.5}
+flow: {path: independent, time_sampling: uniform}
+solver: {method: heun, num_steps: 32}
+training: {batch_size: 512, gradient_accumulation: 1, learning_rate: 0.0001, weight_decay: 0.01, max_steps: 50000, max_epochs: 40, min_steps: 5000, warmup_steps: 1000, gradient_clip_norm: 1.0, precision: bf16, sdpa_backend: math, checkpoint_interval: 2500, dataloader_workers: 2, prefetch_factor: 2, log_interval: 10, ema_decay: 0.9999, ema_update_interval: 10}
+classifier_free_guidance: false
+condition_dropout: 0.0
+guidance_scale: 1.0

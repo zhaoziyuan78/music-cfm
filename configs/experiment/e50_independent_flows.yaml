@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: cfm
+  - override /independence: none
+experiment: {name: e50_independent_flows, stage: transport, negative_control: independent_flows}
+transport:
+  independent_per_style: true
+  conditioning: {num_styles: 6}

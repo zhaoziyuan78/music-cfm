@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: ot_cfm
+  - override /independence: exoreg
+experiment: {name: e23_otcfm_exoreg, stage: abduction}

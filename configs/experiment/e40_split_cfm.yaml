@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: split_cfm
+  - override /independence: exoreg
+experiment: {name: e40_split_cfm, stage: abduction, weak_split: true}
