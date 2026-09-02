@@ -1,0 +1,7 @@
+name: xmidi
+raw_subdir: xmidi
+style_namespace: xmidi.genre
+task: genre
+segmentation: {num_bars: 8, hop_bars: 4, allowed_time_signatures: ["4/4"], minimum_notes: 16, maximum_notes: 4096, drop_incomplete_final_segment: true}
+split: {train: 0.8, validation: 0.1, test: 0.1, seed: 42}
+deduplication: {exact: true, near_duplicate: {enabled: false}}

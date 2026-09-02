@@ -5,7 +5,6 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .coverage
-data/
 runs/
 checkpoints/
 artifacts/
