@@ -209,6 +209,7 @@ def _wait_for_markers(
 
     pending = set(markers)
     started = time.monotonic()
+    last_progress_status = ""
     progress = progress_bar(description=description, total=len(pending), unit="rank")
     try:
         while pending:
@@ -226,6 +227,7 @@ def _wait_for_markers(
             if pending:
                 if monitor_partitions:
                     now = time.time()
+                    progress_status: list[str] = []
                     for marker in sorted(pending):
                         failure = _read_status(marker.parent / ".failed", build_id)
                         if failure is not None:
@@ -237,6 +239,7 @@ def _wait_for_markers(
                         if heartbeat is None:
                             age = time.monotonic() - started
                             detail = "no heartbeat"
+                            progress_status.append(f"{marker.parent.name}:starting")
                         else:
                             updated_at = heartbeat.get("updated_at")
                             age = (
@@ -248,12 +251,24 @@ def _wait_for_markers(
                                 f"phase={heartbeat.get('phase', '?')}, "
                                 f"samples={heartbeat.get('samples', '?')}"
                             )
+                            sample_count = heartbeat.get("samples", "?")
+                            formatted_samples = (
+                                f"{sample_count:,}" if isinstance(sample_count, int) else "?"
+                            )
+                            progress_status.append(
+                                f"{marker.parent.name}:{heartbeat.get('phase', '?')} "
+                                f"samples={formatted_samples}"
+                            )
                         if age >= stall_timeout_seconds:
                             raise RuntimeError(
                                 f"Latent-cache rank {marker.parent.name} made no progress for "
                                 f"{age:.0f}s ({detail}); aborting all ranks instead of waiting "
                                 "indefinitely"
                             )
+                    status = "; ".join(progress_status)
+                    if status != last_progress_status:
+                        progress.set_postfix_str(status, refresh=True)
+                        last_progress_status = status
                 if time.monotonic() - started >= timeout_seconds:
                     missing = ", ".join(str(path) for path in sorted(pending))
                     raise TimeoutError(f"{description} timed out waiting for: {missing}")
@@ -399,6 +414,7 @@ def _cache(cfg: DictConfig, context: DistributedContext) -> None:
         "segment_id",
         "start_bar",
         "num_bars",
+        "num_notes",
         "raw_token_count",
         "tokenizer_type",
         "tokenizer_version",

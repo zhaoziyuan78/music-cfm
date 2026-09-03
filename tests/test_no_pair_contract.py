@@ -61,3 +61,50 @@ def test_midi_dataset_lru_avoids_reparsing_adjacent_segments(
     dataset[0]
     dataset[1]
     assert calls == 1
+
+
+def test_midi_dataset_detects_source_changes_after_manifest_creation(
+    tiny_midi_path: Path,
+) -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "source_midi_path": str(tiny_midi_path),
+                "split": "train",
+                "valid": True,
+                "start_bar": 0,
+                "num_bars": 2,
+                "num_notes": 999,
+                "style_id": 0,
+                "dataset_id": 0,
+                "sample_id": "changed",
+                "segment_id": "changed:0",
+            }
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=r"Source MIDI changed.*999"):
+        MidiTokenDataset(frame, BarEventTokenizer())[0]
+
+
+def test_midi_dataset_load_error_identifies_source_and_segment(tmp_path: Path) -> None:
+    midi_path = tmp_path / "empty.mid"
+    midi_path.write_bytes(b"not a midi")
+    frame = pd.DataFrame(
+        [
+            {
+                "source_midi_path": str(midi_path),
+                "split": "train",
+                "valid": True,
+                "start_bar": 0,
+                "num_bars": 2,
+                "style_id": 0,
+                "dataset_id": 0,
+                "sample_id": "broken",
+                "segment_id": "broken:0",
+            }
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=r"empty\.mid.*broken:0"):
+        MidiTokenDataset(frame, BarEventTokenizer())[0]
