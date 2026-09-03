@@ -5,7 +5,7 @@ conditioning: {num_datasets: 4, num_tasks: 8, num_styles: 32, num_genres: 6, num
 flow: {path: independent, time_sampling: uniform}
 solver: {method: heun, num_steps: 32}
 training: {batch_size: 512, gradient_accumulation: 1, learning_rate: 0.0001, weight_decay: 0.01, max_steps: 50000, max_epochs: 60, min_steps: 5000, warmup_steps: 1500, gradient_clip_norm: 1.0, precision: bf16, sdpa_backend: math, checkpoint_interval: 2500, dataloader_workers: 2, prefetch_factor: 2, log_interval: 10, ema_decay: 0.9999, ema_update_interval: 10, class_balance_exponent: 0.5, validation_samples_per_style: 16}
-condition_objective: {enabled: true, weight: 0.5, margin: 0.1, samples_per_batch: 128}
+condition_objective: {enabled: false, weight: 0.0, margin: 0.0, samples_per_batch: 0}
 classifier_free_guidance: false
 condition_dropout: 0.0
 guidance_scale: 1.0

@@ -10,6 +10,10 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
+from cfmusic.conditioning.schema import (
+    condition_schema_provenance,
+    validate_condition_checkpoint,
+)
 from cfmusic.config import CONFIG_DIR, config_mapping, prepare_config
 from cfmusic.data.samplers import BalancedStyleBatchSampler, DistributedBatchSampler
 from cfmusic.distributed import (
@@ -24,7 +28,7 @@ from cfmusic.latent.compatibility import (
 )
 from cfmusic.latent.dataset import LatentDataset
 from cfmusic.models.latent_vector_field import ConditionalVectorField
-from cfmusic.models.probes import FixedNoiseProjector
+from cfmusic.models.probes import DynamicNoiseProjector, MLPProbe
 from cfmusic.paths import save_run_context
 from cfmusic.reproducibility import seed_everything
 from cfmusic.training.abduction_trainer import finetune_abduction_steps
@@ -67,12 +71,25 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         dataset_name=str(cfg.data.name),
     )
     cache_metadata = [dataset.metadata]
-    labels = dataset.frame["style_id"].astype(int).tolist()
     factorial = bool(cfg.experiment.get("factorial", False))
+    task = str(cfg.data.get("task", cfg.task))
+    active_axis = str(cfg.counterfactual.get("factorial_intervention", "genre"))
+    if active_axis == "joint":
+        active_axis = "genre"
     label_values = {
         column: sorted(dataset.frame[column].dropna().astype(int).unique().tolist())
         for column in (("genre_id", "emotion_id") if factorial else ("style_id",))
     }
+    if factorial:
+        emotion_count = max(label_values["emotion_id"]) + 1
+        labels = (
+            dataset.frame["genre_id"].astype(int) * emotion_count
+            + dataset.frame["emotion_id"].astype(int)
+        ).tolist()
+    else:
+        balance_column = f"{task}_id" if f"{task}_id" in dataset.frame else "style_id"
+        labels = dataset.frame[balance_column].astype(int).tolist()
+        label_values["style_id"] = sorted(set(labels))
     validation_batch: dict[str, torch.Tensor] | None = None
     if context.is_main:
         validation_dataset = LatentDataset(
@@ -89,13 +106,16 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         validation_batch = heldout_condition_batch(
             validation_dataset,
             samples_per_style=int(training.get("validation_samples_per_style", 16)),
+            task=task,
+            factorial=factorial,
+            active_axis=active_axis,
         )
     base_sampler = BalancedStyleBatchSampler(
         labels,
         classes_per_batch=int(sampler_cfg.classes_per_batch),
         samples_per_class=int(sampler_cfg.samples_per_class),
         replacement_for_small_classes=bool(sampler_cfg.replacement_for_small_classes),
-        group_ids=dataset.shard_ids,
+        group_ids=dataset.frame["sample_id"].astype(str).tolist(),
         seed=int(cfg.seed),
     )
     sampler = (
@@ -127,6 +147,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         if not isinstance(checkpoint, dict):
             raise TypeError("Stage-1 checkpoint must contain a mapping")
         validate_transport_cache_provenance(checkpoint, cache_metadata)
+        validate_condition_checkpoint(checkpoint, task=task, factorial=factorial)
         stage1_weights = str(training.get("stage1_weights", "raw"))
         transport.load_state_dict(checkpoint_model_state(checkpoint, weights=stage1_weights))
         del checkpoint
@@ -135,15 +156,27 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         if not isinstance(resumed, dict):
             raise TypeError("Stage-2 checkpoint must contain a mapping")
         validate_transport_cache_provenance(resumed, cache_metadata)
+        validate_condition_checkpoint(resumed, task=task, factorial=factorial)
         del resumed
     sample = dataset[0]["latent"]
     if not isinstance(sample, torch.Tensor):
         raise TypeError("Latent dataset returned invalid sample")
     projection_cfg = cfg.independence.noise_projection
-    projector = FixedNoiseProjector(
-        sample.numel(), int(projection_cfg.dim), int(projection_cfg.seed)
+    projector = DynamicNoiseProjector(
+        sample.numel(),
+        int(projection_cfg.dim),
+        num_views=int(projection_cfg.get("views", 3)),
+        seed=int(projection_cfg.seed),
+        refresh_interval=int(projection_cfg.get("refresh_interval", 1)),
+        block_tokens=int(projection_cfg.get("block_tokens", 8)),
+        block_channels=int(projection_cfg.get("block_channels", 32)),
     ).to(device)
-    transport.add_module("noise_projector", projector)
+    adversarial_weight = float(cfg.independence.get("adversarial_weight", 0.0))
+    adversary: torch.nn.Module | None = None
+    if adversarial_weight > 0:
+        maximum_label = max(value for values in label_values.values() for value in values)
+        adversary = MLPProbe(int(projection_cfg.dim), maximum_label + 1).to(device)
+        transport.add_module("exogeneity_adversary", adversary)
     for module in transport.modules():
         if isinstance(module, ConditionalVectorField):
             module.set_gradient_checkpointing(bool(training.gradient_checkpointing))
@@ -191,6 +224,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     finetune_abduction_steps(
         transport,
         projector,
+        adversary,
         loader,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -200,6 +234,8 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         inverse_steps=int(training.train_inverse_steps),
         hsic_weight=float(cfg.independence.hsic_weight),
         prior_weight=float(cfg.independence.prior_weight),
+        cross_class_weight=float(cfg.independence.get("cross_class_mmd_weight", 0.0)),
+        adversarial_weight=adversarial_weight,
         roundtrip_weight=float(cfg.independence.roundtrip.weight),
         cosine_weight=float(cfg.independence.roundtrip.cosine_weight),
         warmup_steps=int(cfg.independence.warmup_steps),
@@ -216,8 +252,11 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
             ),
             "stage1_weights": str(training.get("stage1_weights", "raw")),
             "latent_cache_metadata_json": serialize_cache_metadata(cache_metadata),
+            **condition_schema_provenance(task=task, factorial=factorial),
         },
         factorial_conditioning=factorial,
+        condition_task=task,
+        factorial_active_axis=active_axis,
         condition_contrast_weight=condition_contrast_weight,
         condition_contrast_margin=float(condition_objective.get("margin", 0.0)),
         condition_contrast_samples=(
@@ -232,6 +271,8 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         condition_vocabularies=label_values,
         validation_batch=validation_batch,
         validation_seed=int(cfg.seed) + 2026,
+        validation_solver_steps=int(training.get("validation_solver_steps", 8)),
+        ema_decay=float(training.get("ema_decay", 0.999)),
         ema_update_interval=int(training.get("ema_update_interval", 10)),
         log_interval=int(training.get("log_interval", 10)),
         resume_from=resume_checkpoint,

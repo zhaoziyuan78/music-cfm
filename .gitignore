@@ -9,6 +9,7 @@ runs/
 checkpoints/
 artifacts/
 reports/
+external/
 *.pt
 *.part
 dist/

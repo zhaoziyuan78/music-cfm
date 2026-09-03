@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +43,7 @@ def test_versioned_latent_cache(tmp_path: Path) -> None:
     actual = load_statistics(tmp_path)
     torch.testing.assert_close(actual.mean, expected.mean)
     torch.testing.assert_close(actual.std, expected.std)
+    assert actual.mean.shape == (2, 4)
     assert actual.count == 4
 
 
@@ -93,3 +95,14 @@ def test_distributed_partitions_finalize_into_one_cache(tmp_path: Path) -> None:
     torch.testing.assert_close(actual.mean, expected.mean)
     torch.testing.assert_close(actual.std, expected.std)
     assert actual.count == 6
+
+
+def test_obsolete_latent_normalization_is_rejected(tmp_path: Path) -> None:
+    torch.save(torch.zeros(4), tmp_path / "latent_mean.pt")
+    torch.save(torch.ones(4), tmp_path / "latent_std.pt")
+    (tmp_path / "latent_stats.json").write_text(
+        json.dumps({"train_samples": 2, "latent_dim": 4}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="obsolete normalization"):
+        load_statistics(tmp_path)

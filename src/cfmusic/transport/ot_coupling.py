@@ -74,7 +74,12 @@ def couple_noise_to_data(
             for _ in range(50):
                 kernel = kernel / kernel.sum(1, keepdim=True).clamp_min(1e-12)
                 kernel = kernel / kernel.sum(0, keepdim=True).clamp_min(1e-12)
-            chosen = indices[kernel.argmax(dim=0)]
+            # Independent argmax can select one Gaussian row more than once.  A
+            # maximum-weight bipartite rounding preserves the required permutation.
+            row, column = linear_sum_assignment(-kernel.detach().cpu().numpy())
+            permutation = np.empty(len(row), dtype=np.int64)
+            permutation[column] = row
+            chosen = indices[torch.as_tensor(permutation, device=indices.device)]
         else:
             raise ValueError(f"Unsupported OT solver: {solver}")
         output.index_copy_(0, indices, noise.index_select(0, chosen))

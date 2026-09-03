@@ -18,6 +18,8 @@ class BatchSamplerProtocol(Protocol):
 
 
 class BalancedStyleBatchSampler(Sampler[list[int]]):
+    """Sample ``style -> unique song -> one segment`` balanced batches."""
+
     def __init__(
         self,
         labels: Sequence[int],
@@ -43,6 +45,7 @@ class BalancedStyleBatchSampler(Sampler[list[int]]):
             for index, (label, group_id) in enumerate(zip(labels, group_ids, strict=True)):
                 by_class_group[int(label)][str(group_id)].append(index)
         self.by_class_group = {label: dict(groups) for label, groups in by_class_group.items()}
+        self.group_names = {label: sorted(groups) for label, groups in self.by_class_group.items()}
         self.classes_per_batch = min(classes_per_batch, len(by_class))
         self.samples_per_class = samples_per_class
         self.replacement = replacement_for_small_classes
@@ -71,15 +74,16 @@ class BalancedStyleBatchSampler(Sampler[list[int]]):
                 candidates = self.by_class[label]
                 if self.by_class_group:
                     groups = self.by_class_group[label]
-                    group_names = sorted(groups)
-                    candidates = groups[
-                        rng.choices(
-                            group_names,
-                            weights=[len(groups[name]) for name in group_names],
-                            k=1,
-                        )[0]
-                    ]
-                if len(candidates) >= self.samples_per_class:
+                    group_names = self.group_names[label]
+                    if len(group_names) < self.samples_per_class:
+                        raise ValueError(
+                            f"Class {label} has only {len(group_names)} unique sample_id groups, "
+                            f"fewer than samples_per_class={self.samples_per_class}; reducing the "
+                            "batch is required because a song may occur at most once"
+                        )
+                    chosen_groups = rng.sample(group_names, self.samples_per_class)
+                    batch.extend(rng.choice(groups[name]) for name in chosen_groups)
+                elif len(candidates) >= self.samples_per_class:
                     batch.extend(rng.sample(candidates, self.samples_per_class))
                 elif self.replacement:
                     batch.extend(rng.choices(candidates, k=self.samples_per_class))
@@ -90,7 +94,7 @@ class BalancedStyleBatchSampler(Sampler[list[int]]):
 
 
 class ShardBatchSampler(Sampler[list[int]]):
-    """Build batches within latent shards and balance complete shard runs over ranks.
+    """Balance shard-local work over ranks, optionally sampling one segment per song.
 
     Random sample-level shuffling is pathological for large tensor shards: a one-shard
     dataset cache otherwise reloads a roughly 128 MiB file for nearly every sample.  This
@@ -103,6 +107,7 @@ class ShardBatchSampler(Sampler[list[int]]):
         shard_ids: Sequence[str],
         *,
         batch_size: int,
+        sample_ids: Sequence[str] | None = None,
         rank: int = 0,
         world_size: int = 1,
         drop_last: bool = False,
@@ -114,9 +119,24 @@ class ShardBatchSampler(Sampler[list[int]]):
             raise ValueError("ShardBatchSampler requires at least one sample")
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("Invalid distributed rank/world_size")
+        if sample_ids is not None and len(sample_ids) != len(shard_ids):
+            raise ValueError("sample_ids and shard_ids must have the same length")
+        self._song_segments: dict[int, list[int]] = {}
         by_shard: dict[str, list[int]] = defaultdict(list)
-        for index, shard_id in enumerate(shard_ids):
-            by_shard[str(shard_id)].append(index)
+        if sample_ids is None:
+            for index, shard_id in enumerate(shard_ids):
+                by_shard[str(shard_id)].append(index)
+        else:
+            by_song: dict[str, list[int]] = defaultdict(list)
+            for index, sample_id in enumerate(sample_ids):
+                by_song[str(sample_id)].append(index)
+            for indices in by_song.values():
+                shards = [str(shard_ids[index]) for index in indices]
+                primary = max(sorted(set(shards)), key=shards.count)
+                local_indices = [index for index in indices if str(shard_ids[index]) == primary]
+                representative = local_indices[0]
+                self._song_segments[representative] = local_indices
+                by_shard[primary].append(representative)
         self.by_shard = dict(by_shard)
         self.batch_size = batch_size
         self.rank = rank
@@ -126,6 +146,14 @@ class ShardBatchSampler(Sampler[list[int]]):
         self.epoch = 0
         self._rank_groups = self._assign_groups()
         self._length = max(self._batch_count(groups) for groups in self._rank_groups)
+        if self._song_segments:
+            # Keep the optimizer budget comparable to segment-level training while
+            # giving every song equal exposure and changing its selected window on
+            # repeated song passes.
+            self._length = max(
+                self._length,
+                math.ceil(len(shard_ids) / (self.batch_size * self.world_size)),
+            )
 
     def _count(self, sample_count: int) -> int:
         full, remainder = divmod(sample_count, self.batch_size)
@@ -176,11 +204,41 @@ class ShardBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch)
         groups = self._rank_groups[self.rank]
+        if self._song_segments:
+            produced = 0
+            while produced < self._length:
+                shard_names = list(groups)
+                rng.shuffle(shard_names)
+                representatives: list[int] = []
+                for shard_name in shard_names:
+                    shard_representatives = list(groups[shard_name])
+                    rng.shuffle(shard_representatives)
+                    representatives.extend(shard_representatives)
+                if not representatives:
+                    raise RuntimeError("ShardBatchSampler rank has no song representatives")
+                if self.drop_last and len(representatives) < self.batch_size:
+                    raise RuntimeError(
+                        "drop_last=True cannot produce a song-unique batch on this rank"
+                    )
+                for start in range(0, len(representatives), self.batch_size):
+                    if produced >= self._length:
+                        break
+                    batch_representatives = representatives[start : start + self.batch_size]
+                    if len(batch_representatives) < self.batch_size and self.drop_last:
+                        continue
+                    batch = [
+                        rng.choice(self._song_segments[index]) for index in batch_representatives
+                    ]
+                    produced += 1
+                    yield batch
+            return
         shard_names = list(groups)
         rng.shuffle(shard_names)
         batches: list[list[int]] = []
         for shard_name in shard_names:
-            indices = list(groups[shard_name])
+            indices = [
+                rng.choice(self._song_segments.get(index, [index])) for index in groups[shard_name]
+            ]
             rng.shuffle(indices)
             for start in range(0, len(indices), self.batch_size):
                 batch = indices[start : start + self.batch_size]
@@ -233,6 +291,74 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
             rng.shuffle(batch)
             yield batch
         self.epoch += 1
+
+
+class GroupedLengthBatchSampler(Sampler[list[int]]):
+    """Pack source-local groups into similarly sized inference batches.
+
+    A global length sort minimizes padding but scatters the windows from each source
+    MIDI over many workers and batches.  Keeping every (small) source group together
+    lets :class:`MidiTokenDataset` parse that MIDI once while sorting groups by their
+    maximum length still avoids padding every batch to an unrelated long sequence.
+    """
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        *,
+        group_ids: Sequence[str],
+        batch_size: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if len(lengths) != len(group_ids) or not lengths:
+            raise ValueError("lengths and group_ids must have the same non-zero length")
+        normalized_lengths = [max(1, int(length)) for length in lengths]
+        by_group: dict[str, list[int]] = defaultdict(list)
+        for index, group_id in enumerate(group_ids):
+            by_group[str(group_id)].append(index)
+
+        # A source normally contributes only a few dozen windows.  Chunk unusually
+        # large sources so the batch-size bound remains strict.
+        chunks: list[tuple[int, str, int, list[int]]] = []
+        for group_id, indices in by_group.items():
+            for chunk_number, start in enumerate(range(0, len(indices), batch_size)):
+                chunk = indices[start : start + batch_size]
+                maximum = max(normalized_lengths[index] for index in chunk)
+                chunks.append((maximum, group_id, chunk_number, chunk))
+        chunks.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        batches: list[list[int]] = []
+        current: list[int] = []
+        for _, _, _, chunk in chunks:
+            if current and len(current) + len(chunk) > batch_size:
+                batches.append(current)
+                current = []
+            current.extend(chunk)
+        if current:
+            batches.append(current)
+        self.batches = batches
+        self.lengths = normalized_lengths
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        # Cache construction is deterministic inference, so no epoch shuffle is
+        # needed.  Group contents stay contiguous for the per-worker MIDI LRU cache.
+        for batch in self.batches:
+            yield list(batch)
+
+    @property
+    def estimated_attention_efficiency(self) -> float:
+        """Useful token-square work divided by padded token-square work."""
+
+        useful = sum(length * length for length in self.lengths)
+        padded = sum(
+            len(batch) * max(self.lengths[index] for index in batch) ** 2
+            for batch in self.batches
+        )
+        return useful / padded
 
 
 class DatasetTemperatureLengthBatchSampler(Sampler[list[int]]):

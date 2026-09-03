@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Music-SCM 全链路方法、网络架构、训练与评估设计">
+  <title>Music-SCM · Full Pipeline Method</title>
+  <style>
+    :root {
+      --ink: #132f31;
+      --muted: #607374;
+      --paper: #f4f0e7;
+      --panel: rgba(255,255,255,.75);
+      --solid: #fffdf8;
+      --line: rgba(19,47,49,.14);
+      --teal: #087f78;
+      --teal2: #14a79c;
+      --coral: #e86a45;
+      --amber: #dfa532;
+      --navy: #173f48;
+      --shadow: 0 20px 60px rgba(24,48,48,.10);
+      --radius: 22px;
+    }
+    html[data-theme="dark"] {
+      --ink: #e8f2ee;
+      --muted: #9cafad;
+      --paper: #102326;
+      --panel: rgba(23,50,53,.84);
+      --solid: #183438;
+      --line: rgba(232,242,238,.14);
+      --navy: #a5ded7;
+      --shadow: 0 20px 60px rgba(0,0,0,.24);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 7% 5%, rgba(20,167,156,.16), transparent 29rem),
+        radial-gradient(circle at 96% 14%, rgba(232,106,69,.12), transparent 25rem),
+        var(--paper);
+      font: 16px/1.7 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      opacity: .34;
+      background-image: linear-gradient(rgba(19,47,49,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(19,47,49,.035) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, #000, transparent 84%);
+    }
+    a { color: inherit; }
+    button { font: inherit; }
+    .progress-line {
+      position: fixed; top: 0; left: 0; z-index: 100; width: 0; height: 3px;
+      background: linear-gradient(90deg, var(--teal), var(--coral));
+    }
+    .shell { display: grid; grid-template-columns: 250px minmax(0,1fr); min-height: 100vh; }
+    aside {
+      position: sticky; top: 0; z-index: 10; height: 100vh; padding: 30px 22px;
+      border-right: 1px solid var(--line); background: rgba(244,240,231,.68);
+      backdrop-filter: blur(16px);
+    }
+    html[data-theme="dark"] aside { background: rgba(16,35,38,.74); }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 850; letter-spacing: -.02em; }
+    .brand-mark {
+      display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px;
+      color: white; background: var(--teal); box-shadow: 0 8px 20px rgba(8,127,120,.24);
+    }
+    .meta { margin: 10px 0 24px 49px; color: var(--muted); font-size: 12px; }
+    nav { display: grid; gap: 2px; }
+    nav a {
+      padding: 7px 11px; border-radius: 11px; color: var(--muted); text-decoration: none;
+      font-size: 13px; transition: .18s ease;
+    }
+    nav a:hover, nav a.active { color: var(--ink); background: var(--panel); transform: translateX(2px); }
+    nav a.active { box-shadow: inset 3px 0 var(--teal); }
+    .aside-foot { position: absolute; right: 22px; bottom: 26px; left: 22px; }
+    .theme {
+      width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px;
+      color: var(--ink); background: var(--panel); cursor: pointer;
+    }
+    main { width: min(1180px, calc(100% - 64px)); margin: 0 auto; padding: 58px 0 100px; }
+    section { margin: 88px 0; scroll-margin-top: 24px; }
+    .hero { display: grid; align-content: center; min-height: 76vh; margin-top: 8px; }
+    .eyebrow {
+      width: max-content; padding: 6px 10px; border: 1px solid rgba(8,127,120,.25);
+      border-radius: 999px; color: var(--teal); background: rgba(20,167,156,.07);
+      font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 970px; margin: 20px 0 18px; font-size: clamp(48px,7vw,92px);
+      line-height: .98; letter-spacing: -.07em;
+    }
+    h1 span { color: var(--teal); }
+    h2 { margin-bottom: 17px; font-size: clamp(31px,4vw,48px); line-height: 1.1; letter-spacing: -.045em; }
+    h3 { font-size: 19px; line-height: 1.35; letter-spacing: -.02em; }
+    .lede { max-width: 870px; color: var(--muted); font-size: clamp(18px,2vw,23px); line-height: 1.55; }
+    .section-kicker { color: var(--coral); font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    .intro { max-width: 850px; color: var(--muted); font-size: 18px; }
+    .kpis { display: grid; grid-template-columns: repeat(4,1fr); gap: 13px; margin-top: 32px; }
+    .kpi, .card {
+      border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+      box-shadow: var(--shadow); backdrop-filter: blur(10px);
+    }
+    .kpi { padding: 20px; }
+    .kpi strong { display: block; font-size: 27px; line-height: 1.1; letter-spacing: -.04em; }
+    .kpi small { color: var(--muted); }
+    .card { padding: 24px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 16px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 12px; }
+    .callout {
+      padding: 19px 22px; border-left: 4px solid var(--teal); border-radius: 0 16px 16px 0;
+      background: var(--panel);
+    }
+    .flow {
+      display: grid; grid-template-columns: repeat(7,minmax(112px,1fr)); gap: 22px;
+      overflow-x: auto; padding: 14px 4px 27px;
+    }
+    .node {
+      position: relative; min-width: 120px; padding: 17px 14px; border: 1px solid var(--line);
+      border-radius: 16px; background: var(--solid);
+    }
+    .node:not(:last-child)::after {
+      content: "→"; position: absolute; top: 50%; right: -18px; color: var(--teal);
+      font-weight: 900; transform: translateY(-50%);
+    }
+    .node b, .node small { display: block; }
+    .node b { margin: 4px 0; }
+    .node small { color: var(--muted); line-height: 1.45; }
+    .step { color: var(--coral); font: 800 11px/1 ui-monospace,monospace; letter-spacing: .1em; }
+    .equation {
+      overflow-x: auto; padding: 18px 20px; border-radius: 16px; color: #e8f4ef;
+      background: #112d31; font: 15px/1.75 ui-monospace,SFMono-Regular,Menlo,monospace;
+    }
+    .specs { display: flex; flex-wrap: wrap; gap: 7px; }
+    .specs span {
+      padding: 5px 8px; border: 1px solid rgba(20,167,156,.13); border-radius: 8px;
+      background: rgba(20,167,156,.09); font: 700 11px/1.3 ui-monospace,monospace;
+    }
+    .architecture { display: grid; grid-template-columns: 1fr 52px 1.2fr 52px 1fr; gap: 10px; align-items: stretch; }
+    .arch-block {
+      display: grid; align-content: center; min-height: 205px; padding: 25px;
+      border: 1px solid var(--line); border-radius: 20px; background: var(--solid);
+    }
+    .arch-block.center { color: white; background: linear-gradient(145deg,#173f48,#087f78); }
+    html[data-theme="dark"] .arch-block.center { background: linear-gradient(145deg,#08766f,#16434b); }
+    .arch-arrow { display: grid; place-items: center; color: var(--teal); font-size: 30px; }
+    .method-row { display: grid; grid-template-columns: 54px 1fr; gap: 14px; padding: 17px 0; border-bottom: 1px solid var(--line); }
+    .method-row:last-child { border-bottom: 0; }
+    .icon {
+      display: grid; place-items: center; width: 44px; height: 44px; border-radius: 13px;
+      color: white; background: var(--teal); font-weight: 850;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { color: var(--muted); font-size: 10px; letter-spacing: .06em; text-align: left; text-transform: uppercase; }
+    th, td { padding: 12px 11px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tbody tr:hover { background: rgba(20,167,156,.045); }
+    .table-wrap { overflow-x: auto; padding: 2px 12px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
+    ul, ol { padding-left: 20px; }
+    li { margin: 5px 0; }
+    code { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size: .88em; }
+    pre {
+      position: relative; overflow: auto; margin: 0; padding: 20px; border-radius: 16px;
+      color: #dff1eb; background: #102b2f; font: 12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;
+    }
+    .copy {
+      position: absolute; top: 10px; right: 10px; padding: 5px 9px; border: 1px solid rgba(255,255,255,.2);
+      border-radius: 8px; color: white; background: rgba(255,255,255,.08); cursor: pointer;
+    }
+    .fork { display: grid; grid-template-columns: .9fr 42px 1fr; gap: 10px; align-items: center; }
+    .fork-line { height: 2px; background: linear-gradient(90deg,var(--teal),var(--coral)); }
+    .repo-map { display: grid; grid-template-columns: repeat(2,1fr); gap: 9px; }
+    .repo-map div { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--solid); }
+    .repo-map code { color: var(--teal); font-weight: 750; }
+    footer { display: flex; justify-content: space-between; gap: 15px; padding-top: 25px; border-top: 1px solid var(--line); color: var(--muted); }
+    @media (max-width: 980px) {
+      .shell { display: block; }
+      aside {
+        display: flex; align-items: center; gap: 12px; overflow-x: auto; height: auto;
+        padding: 12px 18px; border-right: 0; border-bottom: 1px solid var(--line);
+      }
+      aside nav { display: flex; white-space: nowrap; }
+      .meta, .aside-foot { display: none; }
+      main { width: min(100% - 34px,900px); padding-top: 35px; }
+      .hero { min-height: auto; padding-top: 46px; }
+      .kpis, .grid-4 { grid-template-columns: repeat(2,1fr); }
+      .architecture { grid-template-columns: 1fr; }
+      .arch-arrow { min-height: 38px; transform: rotate(90deg); }
+    }
+    @media (max-width: 680px) {
+      section { margin: 64px 0; }
+      .grid-2, .grid-3, .fork, .repo-map { grid-template-columns: 1fr; }
+      .fork-line { width: 2px; height: 28px; margin: auto; }
+      .kpi, .card { padding: 18px; }
+      h1 { font-size: 49px; }
+    }
+    @media print {
+      aside, .progress-line, .copy { display: none !important; }
+      .shell { display: block; }
+      main { width: 100%; padding: 0; }
+      section { margin: 34px 0; break-inside: avoid; }
+      .card, .kpi { box-shadow: none; background: white; }
+      body { color: #162b2c; background: white; font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress-line" aria-hidden="true"></div>
+  <div class="shell">
+    <aside>
+      <div>
+        <div class="brand"><span class="brand-mark">M</span> Music-SCM</div>
+        <div class="meta">FULL PIPELINE METHOD</div>
+      </div>
+      <nav aria-label="页面目录">
+        <a href="#objective">01 · 任务定义</a>
+        <a href="#pipeline">02 · 全链路</a>
+        <a href="#data">03 · 数据预处理</a>
+        <a href="#beat">04 · BEAT</a>
+        <a href="#vae">05 · Transformer VAE</a>
+        <a href="#latent">06 · Latent 与条件</a>
+        <a href="#stage1">07 · Stage 1</a>
+        <a href="#stage2">08 · Stage 2</a>
+        <a href="#alternatives">09 · 对照方法</a>
+        <a href="#generation">10 · 反事实生成</a>
+        <a href="#evaluation">11 · Evaluation</a>
+        <a href="#execution">12 · 训练与执行</a>
+      </nav>
+      <div class="aside-foot"><button class="theme" type="button" aria-label="切换颜色主题">◐ 切换明暗主题</button></div>
+    </aside>
+
+    <main>
+      <section class="hero" id="objective">
+        <div class="eyebrow">Unpaired counterfactual symbolic music</div>
+        <h1>编码音乐，<span>反演共享噪声</span>，干预风格。</h1>
+        <p class="lede">Music-SCM 将符号音乐反事实建模为条件生成映射的逆向与正向组合：先在源风格条件下从原曲 latent 反演个体噪声，再保持该噪声不变，仅替换目标风格条件并重新生成。</p>
+        <div class="kpis">
+          <div class="kpi"><strong>593</strong><small>BEAT vocabulary</small></div>
+          <div class="kpi"><strong>64 × 512</strong><small>pitched latent</small></div>
+          <div class="kpi"><strong>10 × 768</strong><small>CFM DiT backbone</small></div>
+          <div class="kpi"><strong>32-step</strong><small>Heun generation</small></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-kicker">Problem formulation</div>
+        <h2>无配对训练下的共享噪声结构</h2>
+        <div class="grid-2">
+          <article class="card">
+            <h3>输入与目标</h3>
+            <p class="muted">训练数据只包含独立的 MIDI 片段及其 style label，不要求同一首曲子的多个风格版本。模型学习每个条件分布，而不是学习 source-target 成对映射。</p>
+            <div class="specs"><span>UNPAIRED</span><span>SYMBOLIC MIDI</span><span>STYLE INTERVENTION</span></div>
+          </article>
+          <article class="card">
+            <h3>反事实操作</h3>
+            <div class="equation">z = E_VAE(x)<br>u = F⁻¹_source(z)<br>z_cf = F_target(u)<br>x_cf = D_VAE(z_cf)</div>
+            <p class="tiny muted" style="margin-top:12px">共享变量是 abducted noise <code>u</code>；干预只发生在 condition。</p>
+          </article>
+        </div>
+        <div class="callout" style="margin-top:18px">Stage 1 学习条件生成分布；Stage 2 约束反演噪声的风格独立性、先验匹配和 source-condition round trip。Evaluation 将风格变化、非风格内容保留、噪声泄漏和 MIDI 合法性分别报告。</div>
+      </section>
+
+      <section id="pipeline">
+        <div class="section-kicker">End-to-end pipeline</div>
+        <h2>从原始 MIDI 到反事实评估</h2>
+        <div class="flow" aria-label="Music-SCM 全链路">
+          <div class="node"><span class="step">01</span><b>Prepare</b><small>校验 · 规范化<br>去重 · group split</small></div>
+          <div class="node"><span class="step">02</span><b>Tokenize</b><small>BEAT 593 tokens<br>小节级表示</small></div>
+          <div class="node"><span class="step">03</span><b>Codec</b><small>Transformer VAE<br>MIDI ↔ latent</small></div>
+          <div class="node"><span class="step">04</span><b>Cache</b><small>posterior mean<br>per-token norm</small></div>
+          <div class="node"><span class="step">05</span><b>Transport</b><small>I-CFM / DDIM<br>条件分布学习</small></div>
+          <div class="node"><span class="step">06</span><b>Intervene</b><small>abduct source<br>predict target</small></div>
+          <div class="node"><span class="step">07</span><b>Evaluate</b><small>style · content<br>noise · quality</small></div>
+        </div>
+        <div class="grid-3">
+          <article class="card"><h3>表示层</h3><p class="muted">MIDI → BEAT tokens → VAE latent。该层决定重建上限和后续连续空间的几何结构。</p></article>
+          <article class="card"><h3>因果接口层</h3><p class="muted">共享 conditional transport 提供 <code>abduct</code>、<code>predict</code> 与 <code>counterfactual</code> 统一 API。</p></article>
+          <article class="card"><h3>验证层</h3><p class="muted">不依赖 paired target，分别测量风格响应、内容漂移、噪声独立性和 MIDI 结构质量。</p></article>
+        </div>
+      </section>
+
+      <section id="data">
+        <div class="section-kicker">Data layer</div>
+        <h2>下载、校验、去重与无泄漏切分</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Dataset</th><th>Condition task</th><th>Segmentation</th><th>Codec scope</th><th>Experiment role</th></tr></thead>
+            <tbody>
+              <tr><td><b>XMIDI</b></td><td>6-class genre；可选 genre+emotion factorial</td><td>8 bars，hop 4</td><td>pitched VAE</td><td>主 pipeline</td></tr>
+              <tr><td>EMOPIA</td><td>4-quadrant emotion</td><td>8 bars，hop 4</td><td>独立 pitched VAE</td><td>emotion extension</td></tr>
+              <tr><td>VGMIDI</td><td>4-quadrant emotion</td><td>8 bars，hop 4</td><td>独立 pitched VAE</td><td>emotion / cross-domain</td></tr>
+              <tr><td>Groove</td><td>top-8 primary drum style</td><td>4 bars，hop 2</td><td>独立 drum VAE</td><td>drum extension</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid-4" style="margin-top:18px">
+          <article class="card"><span class="step">A</span><h3>License gate</h3><p class="muted tiny">数据源、许可和 acknowledgement 在下载配置中显式声明。</p></article>
+          <article class="card"><span class="step">B</span><h3>MIDI audit</h3><p class="muted tiny">校验文件可读性、时间签名、note 数量与 segment 完整性。</p></article>
+          <article class="card"><span class="step">C</span><h3>Exact dedup</h3><p class="muted tiny">原文件和 canonical-event SHA-256 用于 provenance 与重复簇。</p></article>
+          <article class="card"><span class="step">D</span><h3>Group split</h3><p class="muted tiny">song/duplicate cluster 整体进入 80/10/10 的单一 split。</p></article>
+        </div>
+        <p class="intro" style="margin-top:18px">`prepare.py` 对 adapter discover 的记录并行处理；同一次 MIDI 读取完成规范化、切片和 token-length 统计。默认片段为 4/4、至少 16 notes、最多 4096 notes，并丢弃不完整末段。</p>
+      </section>
+
+      <section id="beat">
+        <div class="section-kicker">Tokenizer</div>
+        <h2>BEAT：不需要额外训练的固定音乐表示</h2>
+        <p class="intro">pitched pipeline 只复用 BEAT-code 的 tokenizer 与 vocabulary 设计。本仓库实现 `cfmusic-beat-v1`，在每个 beat 的 4 个 1/16-note 位置上编码音高的 onset/sustain/off pattern，同时保留力度、乐器、速度与拍号等信息。</p>
+        <div class="grid-3">
+          <article class="card">
+            <h3>音符结构</h3>
+            <ul class="muted">
+              <li>81 个四格 tri-state pattern</li>
+              <li>88 个 melodic pitch</li>
+              <li>128 个 velocity token</li>
+              <li>descending relative pitch within track</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>编配与时间</h3>
+            <ul class="muted">
+              <li>128 General MIDI programs</li>
+              <li>独立 drum instrument / pitch</li>
+              <li>BAR、BEAT 与 REST</li>
+              <li>time signature 与 15 个 tempo bins</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>序列约束</h3>
+            <ul class="muted">
+              <li>固定 vocabulary 593</li>
+              <li>最大长度 2560</li>
+              <li>overlength 直接排除而非截断</li>
+              <li>生成时使用 BEAT grammar mask</li>
+            </ul>
+          </article>
+        </div>
+        <div class="equation" style="margin-top:18px">[BOS, TIME_SIGNATURE, TEMPO]<br>→ BAR → BEAT → INSTRUMENT → (PITCH, PATTERN, VELOCITY) × N<br>→ … → EOS</div>
+      </section>
+
+      <section id="vae">
+        <div class="section-kicker">Stage 0 · codec</div>
+        <h2>Transformer VAE 网络架构</h2>
+        <div class="architecture">
+          <div class="arch-block">
+            <span class="step">ENCODER</span>
+            <h3>12-layer Transformer</h3>
+            <p class="muted">593→768 token embedding + learned positional embedding；12 heads；pre-norm；FFN ratio 4。</p>
+            <div class="specs"><span>D_MODEL 768</span><span>MAX LEN 2560</span></div>
+          </div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-block center">
+            <span class="step" style="color:#96eee5">LATENT POSTERIOR</span>
+            <h3>64 learned queries</h3>
+            <p>learned queries 对 encoder states 做 cross-attention，再由线性 head 产生每个 query 的 512 维 μ 与 log σ²。</p>
+            <div class="specs"><span>64 × 512</span><span>DIAGONAL GAUSSIAN</span></div>
+          </div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-block">
+            <span class="step">DECODER</span>
+            <h3>12-layer causal Transformer</h3>
+            <p class="muted">token prefix 自注意力 + latent-memory cross-attention；输出 593 类 token logits。</p>
+            <div class="specs"><span>12 HEADS</span><span>K/V CACHE</span></div>
+          </div>
+        </div>
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card">
+            <h3>VAE 训练目标</h3>
+            <div class="equation">L_VAE = CE(x, x̂)<br>+ β(t) · meanⱼ max(KLⱼ, 0.05)<br><br>β(t): 0 → 1e−4 over 20k steps</div>
+            <p class="muted tiny" style="margin-top:12px">训练从 posterior 采样；validation、cache 和 transport 固定使用 posterior mean。</p>
+          </article>
+          <article class="card">
+            <h3>优化与防止 posterior bypass</h3>
+            <ul class="muted">
+              <li>AdamW：lr 1e−4，weight decay .01，betas (.9,.95)</li>
+              <li>5k warmup + cosine，BF16，gradient clip 1.0，EMA .999</li>
+              <li>decoder token dropout .15，迫使 decoder 使用 latent</li>
+              <li>length bucketing + activation checkpointing</li>
+              <li>32 samples/GPU；100k steps 或 8 epochs</li>
+            </ul>
+          </article>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>自回归解码</h3>
+          <p class="muted">greedy 或 top-p 逐 token 生成；EventGrammar 屏蔽不合法的 BAR/BEAT、instrument、melodic/drum pitch 转移。每层缓存 projected self-attention K/V，并预计算 latent-memory K/V，将重复前缀计算降为标准的增量 attention。</p>
+        </div>
+      </section>
+
+      <section id="latent">
+        <div class="section-kicker">Latent interface</div>
+        <h2>冻结 codec，缓存 posterior mean，统一 condition</h2>
+        <div class="grid-2">
+          <article class="card">
+            <h3>FP16 latent cache</h3>
+            <p class="muted">encoder inference 输出 raw posterior mean，pitched shape 为 `64 × 512`。每 shard 最多 8,192 samples；index 保留 sample、split、style、genre、emotion 与 shard offset。</p>
+            <div class="specs"><span>RAW MEAN</span><span>FP16</span><span>8192/SHARD</span></div>
+            <p class="tiny muted" style="margin-top:12px">metadata 保存 codec checkpoint/config、tokenizer、manifest、normalization、latent shape 与 overlength policy 的 hash。</p>
+          </article>
+          <article class="card">
+            <h3>per-token-v2 normalization</h3>
+            <p class="muted">64 个 learned query 位置分别统计 512 channels；统计仅由 train split 流式计算，validation/test 复用相同参数。</p>
+            <div class="equation">μ, σ ∈ R⁶⁴ˣ⁵¹²<br>z̃ᵢⱼ = (zᵢⱼ − μᵢⱼ) / σᵢⱼ</div>
+          </article>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>task-aware-v2 condition schema</h3>
+          <div class="grid-3">
+            <div class="method-row"><div class="icon">G</div><div><b>Genre task</b><div class="tiny muted">dataset + task + style=genre；genre/emotion slots inactive</div></div></div>
+            <div class="method-row"><div class="icon">E</div><div><b>Emotion / style</b><div class="tiny muted">当前任务标签只进入 style slot</div></div></div>
+            <div class="method-row"><div class="icon">F</div><div><b>Factorial task</b><div class="tiny muted">style=0 sentinel + genre + emotion</div></div></div>
+          </div>
+          <p class="muted tiny" style="margin-top:12px">训练、held-out validation、abduction、target intervention 和 generation 共享同一个 `build_condition_batch()`；factorial 模式一次只修改一个激活轴。</p>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>四卡 cache 调度</h3>
+          <p class="muted">每 GPU encoder batch 384，总 DataLoader workers 32。根据 `raw_token_count²` 的 attention 代价做连续加权分区，各 rank 写独立 shard；准备、完成、索引合并和原子发布通过 build-scoped filesystem markers 协调。</p>
+        </div>
+      </section>
+
+      <section id="stage1">
+        <div class="section-kicker">Stage 1 · conditional flow matching</div>
+        <h2>共享 AdaLN DiT 学习风格条件向量场</h2>
+        <div class="grid-2">
+          <article class="card">
+            <h3>Latent DiT backbone</h3>
+            <ul class="muted">
+              <li>latent input/output channels：512</li>
+              <li>hidden width：768；10 blocks；12 attention heads</li>
+              <li>MLP ratio 4；dropout 0</li>
+              <li>sinusoidal time embedding + two-layer time MLP</li>
+              <li>dataset/task/style/factorial embeddings 相加</li>
+              <li>每个 block 产生 attention/MLP 的 shift、scale、gate</li>
+              <li>vector-field output projection zero-initialized</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Independent CFM objective</h3>
+            <div class="equation">ε ~ N(0, I), &nbsp;t ~ Uniform(0,1)<br>zₜ = (1−t)ε + tz<br>v* = ∂zₜ/∂t = z − ε<br><br>L_CFM = E ||vθ(zₜ,t,c) − v*||²</div>
+            <p class="muted tiny" style="margin-top:12px">loss 按 style frequency 的 inverse square-root 加权。主目标只使用有效 factual condition/path。</p>
+          </article>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>Stage 1 训练策略</h3>
+          <div class="specs"><span>512 / GPU</span><span>GLOBAL 2048 @ 4 GPU</span><span>LR 1E−4</span><span>WARMUP 1500</span><span>MAX 50K</span><span>BF16</span><span>MATH SDPA</span><span>EMA .9999 / 10</span></div>
+          <p class="muted" style="margin-top:13px">ShardBatchSampler 保持磁盘 locality，同时先按 song 等权、再从同一 song 的多个 segment 中轮换选择窗口。held-out validation 从每个 style 取固定样本，用相同噪声生成条件 endpoint，分别计算 raw/EMA 的 class-conditional MMD 与 sliced Wasserstein distance。</p>
+        </div>
+        <div class="fork" style="margin-top:18px">
+          <div class="card"><span class="step">ABDUCTION</span><h3>t = 1 → 0</h3><p class="muted">在 source condition 下对 ODE 反向积分：`z_source → u`。</p></div>
+          <div class="fork-line"></div>
+          <div class="card"><span class="step">PREDICTION</span><h3>t = 0 → 1</h3><p class="muted">在 source condition 下重建 factual latent，或在 target condition 下生成 counterfactual latent。</p></div>
+        </div>
+        <p class="intro" style="margin-top:18px">默认 solver 是 32-step fixed-grid Heun。系统记录实际 NFE；Heun 的 predictor/corrector 通常使 NFE 高于名义 solver steps。</p>
+      </section>
+
+      <section id="stage2">
+        <div class="section-kicker">Stage 2 · exogeneity fine-tuning</div>
+        <h2>约束共享噪声，而不放弃基础生成目标</h2>
+        <p class="intro">Stage 2 从 Stage 1 EMA 权重初始化。每个 step 都保留基础 CFM/DDIM loss；每两个 step 额外执行可微 4-step abduction 和同条件 reconstruction，在全局 DDP batch 上施加外生性和 round-trip 正则。</p>
+        <div class="equation">L = L_base + r(t) [<br>&nbsp;&nbsp;λ_h · HSIC(u, s)<br>&nbsp;+ λ_p · SWD(u, N(0,I))<br>&nbsp;+ λ_c · MMD_cross-class(u)<br>&nbsp;+ λ_r · (L1 round-trip + 0.1 · cosine round-trip)<br>]<br><br>λ_h = .01, λ_p = .005, λ_c = .01, λ_r = .25</div>
+        <div class="grid-3" style="margin-top:18px">
+          <article class="card">
+            <h3>动态多视图 noise</h3>
+            <p class="muted">每 step 重采样 3 个 `32768→128` Rademacher projections，并加入 per-token mean/std summary 与随机 `8 tokens × 32 channels` raw block。</p>
+          </article>
+          <article class="card">
+            <h3>全局 DDP 正则</h3>
+            <p class="muted">features 通过 differentiable all-gather 合并，labels 同步 gather；HSIC、SWD 和 cross-class MMD 在四卡完整 batch 上计算。</p>
+          </article>
+          <article class="card">
+            <h3>层级 balanced sampler</h3>
+            <p class="muted">每 GPU `4 styles × 16 samples`，采样顺序为 style → unique song/sample_id → one segment。</p>
+          </article>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <div class="specs"><span>12K STEPS</span><span>LR 2E−5</span><span>WARMUP 500</span><span>RAMP 2000</span><span>EMA .999 / 10</span><span>INVERSE 4</span></div>
+          <p class="muted" style="margin-top:12px">checkpoint interval 为 1,000 step。每次 checkpoint 同时验证 raw 与 EMA：conditional endpoint MMD/SWD、held-out noise HSIC/SWD/cross-class MMD 和 source-condition round trip。</p>
+        </div>
+      </section>
+
+      <section id="alternatives">
+        <div class="section-kicker">Baselines &amp; ablations</div>
+        <h2>使用同一 latent 接口的 transport 家族</h2>
+        <div class="grid-3">
+          <article class="card">
+            <h3>OT-CFM</h3>
+            <p class="muted">网络、batch 和训练预算与 I-CFM 对齐，仅把 Gaussian–factual coupling 换成 within-style minibatch OT。cost 在 128D 投影上计算，使用 Hungarian 一对一 assignment。</p>
+          </article>
+          <article class="card">
+            <h3>Conditional DDIM</h3>
+            <p class="muted">8 层、width 512、8 heads 的 latent DiT；cosine schedule、1,000 train timesteps、epsilon prediction、deterministic `eta=0`。</p>
+          </article>
+          <article class="card">
+            <h3>DDIM inversion</h3>
+            <p class="muted">vanilla inversion 作为基础方法；fixed-point inversion 每个离散时间步最多迭代 3 次，容差 `1e−5`，并记录实际 NFE。</p>
+          </article>
+          <article class="card">
+            <h3>Weak latent split</h3>
+            <p class="muted">固定可逆正交旋转把 512 channels 分成 256 conserved 与 256 editable，仅对 editable 子空间运行 CFM。</p>
+          </article>
+          <article class="card">
+            <h3>Independent flows</h3>
+            <p class="muted">每个 style 使用独立 flow，作为“没有共享条件向量场/共享噪声语义”的结构负对照。</p>
+          </article>
+          <article class="card">
+            <h3>Shuffled labels</h3>
+            <p class="muted">以固定 seed 对训练标签做持久化 permutation，用于检验评价是否依赖真实条件监督。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="generation">
+        <div class="section-kicker">Counterfactual generation</div>
+        <h2>一次反演，多目标条件批量预测</h2>
+        <div class="grid-2">
+          <article class="card">
+            <h3>样本选择</h3>
+            <ol class="muted">
+              <li>从 test split 按 source style 分组。</li>
+              <li>每个 style 选择 unique source songs。</li>
+              <li>根据 all-other 或 explicit-pair policy 构造 target styles。</li>
+              <li>factorial 模式只替换 genre 或 emotion 中指定的一轴。</li>
+            </ol>
+            <div class="specs"><span>10 SOURCES / STYLE</span><span>60 TOTAL SOURCES</span><span>5 TARGETS / SOURCE</span></div>
+          </article>
+          <article class="card">
+            <h3>批量执行</h3>
+            <ol class="muted">
+              <li>读取并归一化 source latent。</li>
+              <li>source condition 下仅 abduct 一次。</li>
+              <li>同一 noise 与多个 target conditions 组成 batch。</li>
+              <li>反归一化后用 VAE K/V-cache decoder 生成 MIDI。</li>
+            </ol>
+            <div class="specs"><span>TARGET BATCH 8</span><span>DECODE BATCH 8</span><span>4-RANK SOURCE SHARDING</span></div>
+          </article>
+        </div>
+        <div class="flow" style="grid-template-columns:repeat(5,minmax(145px,1fr)); margin-top:10px">
+          <div class="node"><b>Source MIDI</b><small>固定 test song</small></div>
+          <div class="node"><b>Encode</b><small>posterior mean z</small></div>
+          <div class="node"><b>Abduct</b><small>F⁻¹_source(z)=u</small></div>
+          <div class="node"><b>Intervene</b><small>F_target(u)=z_cf</small></div>
+          <div class="node"><b>Decode</b><small>counterfactual MIDI</small></div>
+        </div>
+        <div class="card">
+          <h3>Artifact contract</h3>
+          <p class="muted">每个 transition 保存 `source.mid`、`counterfactual.mid`、`abducted_noise.pt` 与 metadata。metadata 包含 sample/source/target、condition schema、factorial axis、checkpoint provenance、solver steps 和 inverse/forward NFE；完整 artifact 可在重跑时跳过。</p>
+        </div>
+      </section>
+
+      <section id="evaluation">
+        <div class="section-kicker">Unpaired evaluation</div>
+        <h2>风格、内容、外生性和 MIDI 质量分开评价</h2>
+        <div class="grid-2">
+          <article class="card">
+            <h3>① CLaMP 2 风格变化</h3>
+            <p class="muted">generated MIDI 转为 lossless MTF；官方 M3/CLaMP 2 extractor 产生归一化 MIDI embedding。每个 style label 用固定模板构造 text embedding：</p>
+            <div class="equation">“This is a piece of {style} music.”</div>
+            <ul class="muted">
+              <li>generated ↔ target-style cosine</li>
+              <li>generated ↔ source-style cosine</li>
+              <li>target-minus-source similarity margin</li>
+              <li>target prompt 是否为全部 style 中的 argmax</li>
+            </ul>
+            <p class="tiny">XMIDI genre pipeline 只比较 style/genre prompt，不将 emotion 等辅助标签纳入风格变化判断。</p>
+          </article>
+          <article class="card">
+            <h3>② 非风格内容保留</h3>
+            <ul class="muted">
+              <li>pitch-class histogram cosine</li>
+              <li>transposition-invariant top-line melody contour cosine</li>
+              <li>interval、duration、onset、program、drum 与 scalar descriptor cosine</li>
+              <li>source/generated note-density ratio</li>
+              <li>source/generated tempo ratio</li>
+            </ul>
+            <p class="tiny muted">各指标独立输出，不合并成单一 content score。</p>
+          </article>
+          <article class="card">
+            <h3>③ Abducted-noise leakage</h3>
+            <p class="muted">每个 unique source song 只保留一份 noise。评估器重新训练、并与 Stage 2 adversary 独立：</p>
+            <ul class="muted">
+              <li>standardized logistic regression</li>
+              <li>两层 MLP `(128,64)`</li>
+              <li>沿 latent-token 维的两层 Conv1D temporal probe</li>
+              <li>HSIC、classwise moments、Gaussian SWD、pairwise two-sample accuracy</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>④ MIDI 质量</h3>
+            <ul class="muted">
+              <li>source/generated MIDI validity 与具体错误</li>
+              <li>note count、duration beats 与 note density</li>
+              <li>unique pitch classes 与 pitch range</li>
+              <li>non-positive-duration ratio</li>
+              <li>Groove 的 drum-onset F1 扩展</li>
+            </ul>
+          </article>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>Codec 与 transport 内部验证</h3>
+          <div class="grid-2">
+            <div><b>Codec</b><p class="muted tiny">token CE/accuracy、free-running token accuracy、note-event multiset F1、exact sequence、EOS/grammar validity、zero/shuffled-latent degradation。</p></div>
+            <div><b>Transport</b><p class="muted tiny">conditional endpoint MMD/SWD、factual round trip、noise recovery、HSIC/SWD/MMD、16/32/64-step NFE 与 runtime、跨 seed ambiguity。</p></div>
+          </div>
+        </div>
+        <div class="callout" style="margin-top:18px">Evaluation 不训练 in-domain Transformer style classifier 作为主指标；风格判断使用 CLaMP 2 的 MIDI-text embedding，noise probe、content preservation 和 MIDI quality 保持为独立评估维度。</div>
+      </section>
+
+      <section id="execution">
+        <div class="section-kicker">Training system</div>
+        <h2>DDP、日志、rolling checkpoint 与一键 pipeline</h2>
+        <div class="grid-3">
+          <article class="card">
+            <h3>训练状态</h3>
+            <p class="muted">`last.pt` 保存 raw/EMA、optimizer、scheduler、GradScaler、global step、epoch、batch cursor、world size、RNG state、完整 config 和 provenance。</p>
+          </article>
+          <article class="card">
+            <h3>可观测性</h3>
+            <p class="muted">所有长循环使用 tqdm。每个 trainer 输出 JSONL、CSV、text log、TensorBoard events 和原子覆盖的训练曲线。</p>
+          </article>
+          <article class="card">
+            <h3>断点恢复</h3>
+            <p class="muted">checkpoint 始终原子覆盖唯一 `last.pt`。`resume=true` 自动发现并恢复；world size 改变时只重置 epoch 内数据 cursor。</p>
+          </article>
+        </div>
+        <div class="table-wrap" style="margin-top:18px">
+          <table>
+            <thead><tr><th>Stage</th><th>Per-GPU batch</th><th>Precision / attention</th><th>Checkpoint interval</th><th>Launcher</th></tr></thead>
+            <tbody>
+              <tr><td>XMIDI VAE</td><td>32</td><td>BF16 · automatic SDPA · activation checkpointing</td><td>1,000</td><td>1 GPU or torchrun 4 GPU</td></tr>
+              <tr><td>Latent cache</td><td>384</td><td>BF16 inference · weighted rank partition</td><td>atomic cache publish</td><td>1 GPU or torchrun 4 GPU</td></tr>
+              <tr><td>CFM Stage 1</td><td>512</td><td>BF16 · math SDPA</td><td>2,500</td><td>1 GPU or torchrun 4 GPU</td></tr>
+              <tr><td>CFM Stage 2</td><td>64</td><td>BF16 · math SDPA · inverse every 2 steps</td><td>1,000</td><td>1 GPU or torchrun 4 GPU</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="margin-top:18px">
+          <h3>XMIDI 后半程 Slurm pipeline</h3>
+          <pre><button class="copy" type="button">复制</button><code>sbatch cfm.sh
+
+# cfm.sh 顺序执行：
+# 1. cache XMIDI latents
+# 2. train E20 CFM Stage 1
+# 3. fine-tune E22 Stage 2
+# 4. generate counterfactuals
+# 5. evaluate style with CLaMP 2 + content/noise/quality
+# 6. build aggregate report</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-kicker">Repository map</div>
+        <h2>方法组件对应的代码入口</h2>
+        <div class="repo-map">
+          <div><code>configs/</code><br><span class="tiny muted">Hydra 数据、模型、正则和实验组合</span></div>
+          <div><code>src/cfmusic/data/</code><br><span class="tiny muted">adapter、切片、去重、split、sampler</span></div>
+          <div><code>tokenization/beat.py</code><br><span class="tiny muted">BEAT encode/decode</span></div>
+          <div><code>codec/transformer_vae.py</code><br><span class="tiny muted">VAE 与增量 decoder</span></div>
+          <div><code>commands/cache_latents.py</code><br><span class="tiny muted">多卡 latent cache</span></div>
+          <div><code>conditioning/schema.py</code><br><span class="tiny muted">唯一 condition builder</span></div>
+          <div><code>models/latent_vector_field.py</code><br><span class="tiny muted">AdaLN DiT vector field</span></div>
+          <div><code>transport/conditional_flow.py</code><br><span class="tiny muted">CFM 与 ODE counterfactual API</span></div>
+          <div><code>training/transport_trainer.py</code><br><span class="tiny muted">Stage 1 训练与 endpoint validation</span></div>
+          <div><code>training/abduction_trainer.py</code><br><span class="tiny muted">Stage 2 外生性训练</span></div>
+          <div><code>commands/generate_counterfactuals.py</code><br><span class="tiny muted">反演、干预、批量解码</span></div>
+          <div><code>commands/evaluate.py</code><br><span class="tiny muted">CLaMP 2、content、probe、quality</span></div>
+        </div>
+      </section>
+
+      <footer>
+        <span>Music-SCM · Full-chain method overview</span>
+        <span>Data → Codec → Transport → Intervention → Evaluation</span>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const root = document.documentElement;
+    const themeButton = document.querySelector('.theme');
+    const savedTheme = localStorage.getItem('music-scm-theme');
+    if (savedTheme) root.dataset.theme = savedTheme;
+    themeButton?.addEventListener('click', () => {
+      root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('music-scm-theme', root.dataset.theme);
+    });
+
+    const links = [...document.querySelectorAll('nav a')];
+    const sections = links.map(link => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        links.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+      });
+    }, { rootMargin: '-25% 0px -65% 0px' });
+    sections.forEach(section => observer.observe(section));
+
+    const line = document.querySelector('.progress-line');
+    const updateProgress = () => {
+      const scrollable = document.documentElement.scrollHeight - innerHeight;
+      line.style.width = (scrollable > 0 ? scrollY / scrollable * 100 : 0) + '%';
+    };
+    addEventListener('scroll', updateProgress, { passive: true });
+    updateProgress();
+
+    document.querySelectorAll('.copy').forEach(button => button.addEventListener('click', async () => {
+      const code = button.parentElement.querySelector('code').innerText;
+      await navigator.clipboard.writeText(code);
+      button.textContent = '已复制';
+      setTimeout(() => button.textContent = '复制', 1200);
+    }));
+  </script>
+</body>
+</html>

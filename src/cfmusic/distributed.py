@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
@@ -97,6 +98,24 @@ def distributed_max_int(value: int, context: DistributedContext) -> int:
     maximum = torch.tensor(value, dtype=torch.int64, device=context.device)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
     return int(maximum.item())
+
+
+def differentiable_all_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather an equal-sized tensor while retaining cross-rank autograd."""
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    return torch.cat(tuple(dist_nn.all_gather(tensor)), dim=0)
+
+
+def all_gather_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather a non-differentiable tensor such as integer class labels."""
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor)
+    return torch.cat(gathered, dim=0)
 
 
 def decorrelate_worker_rng(context: DistributedContext) -> None:

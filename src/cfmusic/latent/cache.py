@@ -11,7 +11,11 @@ import pandas as pd
 import torch
 from torch import Tensor
 
-from cfmusic.latent.normalization import StreamingLatentStatistics, save_statistics
+from cfmusic.latent.normalization import (
+    NORMALIZATION_SCHEMA_VERSION,
+    StreamingLatentStatistics,
+    save_statistics,
+)
 from cfmusic.progress import progress_bar
 
 
@@ -85,16 +89,18 @@ def write_latent_cache(
         buffer.clear()
         shard_number += 1
 
-    for sample in samples:
-        if not isinstance(sample.get("latent"), Tensor):
-            raise TypeError("Every cache sample requires a Tensor latent")
-        buffer.append(sample)
-        progress.update(1)
-        progress.set_postfix(shards=shard_number, refresh=False)
-        if len(buffer) >= samples_per_shard:
-            flush()
-    flush()
-    progress.close()
+    try:
+        for sample in samples:
+            if not isinstance(sample.get("latent"), Tensor):
+                raise TypeError("Every cache sample requires a Tensor latent")
+            buffer.append(sample)
+            progress.update(1)
+            progress.set_postfix(shards=shard_number, refresh=False)
+            if len(buffer) >= samples_per_shard:
+                flush()
+        flush()
+    finally:
+        progress.close()
     if not index_rows:
         raise ValueError("Cannot write an empty latent cache")
     index_path = destination / "index.parquet"
@@ -112,6 +118,7 @@ def _write_cache_metadata(
 ) -> None:
     cache_metadata = dict(metadata)
     cache_metadata["normalization_hash"] = normalization_hash
+    cache_metadata["normalization_schema_version"] = NORMALIZATION_SCHEMA_VERSION
     (destination / "cache_metadata.json").write_text(
         json.dumps(cache_metadata, indent=2, sort_keys=True), encoding="utf-8"
     )

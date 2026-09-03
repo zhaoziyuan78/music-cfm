@@ -22,6 +22,8 @@ preprocessing:
   workers: 0  # auto: min(8, CPUs available to this job)
   worker_chunksize: 32
 latent_cache:
+  # Reuse validated, completed rank partitions after an interrupted 4-GPU run.
+  resume: true
   samples_per_shard: 8192
   dtype: float16
   # Encoder-only inference saturates an A100 40G near this point while
@@ -32,9 +34,19 @@ latent_cache:
   dataloader_workers: 32  # total across all torchrun ranks
   prefetch_factor: 4
   midi_cache_size: 16
+  # Spawn avoids forking worker pools after CUDA initialization. A wedged
+  # MIDI/NFS read fails promptly and is propagated to every rank.
+  dataloader_timeout_seconds: 180
+  rank_stall_timeout_seconds: 300
+  # Pack similarly sized source-MIDI groups so the encoder avoids unrelated
+  # long padding without forcing workers to parse the same MIDI repeatedly.
+  length_bucketing: true
+  # Filesystem synchronization avoids NCCL watchdog failures while one rank is
+  # still encoding a slow partition or rank 0 is publishing a large cache.
+  synchronization_timeout_seconds: 7200
 counterfactual:
-  # EMA is markedly more stable than the instantaneous weights under ODE inversion.
-  transport_weights: ema
+  # Select explicitly after comparing raw/EMA validation metrics.
+  transport_weights: raw
   target_policy: all_other
   explicit_pairs: []
   # Ten unique songs per source style and five targets produce at most 300
@@ -50,6 +62,13 @@ counterfactual:
   show_decode_progress: true
   deterministic_decode: true
   factorial_intervention: genre
+evaluation:
+  clamp2:
+    enabled: true
+    repository: ${oc.env:CLAMP2_REPOSITORY,${paths.project_root}/external/clamp2}
+    python_executable: null
+    cache_dir: ${oc.env:CLAMP2_CACHE_DIR,${paths.checkpoints_dir}/clamp2/huggingface}
+    style_template: "This is a piece of {style} music."
 report:
   experiments: []
 license:

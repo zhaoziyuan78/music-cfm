@@ -46,8 +46,9 @@ def main(cfg: DictConfig) -> None:
         "inversion_vs_nfe": ["experiment", "inverse_nfe", "mse"],
         "style_content_pareto": [
             "experiment",
-            "descriptor_target_style_probability",
-            "descriptor_cosine",
+            "clamp2_target_minus_source",
+            "pitch_class_histogram_cosine",
+            "melody_contour_cosine",
         ],
         "counterfactual_consistency": ["experiment", "mse", "mae", "cosine"],
         "cross_seed_ambiguity": ["experiment"],

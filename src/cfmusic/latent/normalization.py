@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
+NORMALIZATION_SCHEMA_VERSION = "per-token-v2"
+
 
 @dataclass(frozen=True)
 class LatentStatistics:
@@ -25,7 +27,12 @@ class LatentStatistics:
 
 
 class StreamingLatentStatistics:
-    """Numerically stable feature statistics without retaining every latent."""
+    """Per-token statistics without retaining every latent.
+
+    A VAE latent token is produced by a distinct learned query, so token
+    positions are not exchangeable.  Statistics therefore retain ``[T, D]``
+    instead of flattening tokens into a shared ``[D]`` distribution.
+    """
 
     def __init__(self) -> None:
         self.sample_count = 0
@@ -36,7 +43,7 @@ class StreamingLatentStatistics:
     def update(self, latents: Tensor) -> None:
         if latents.ndim != 3 or latents.shape[0] == 0:
             raise ValueError("Expected nonempty [samples, latent_tokens, latent_dim] tensor")
-        values = latents.detach().cpu().float().reshape(-1, latents.shape[-1])
+        values = latents.detach().cpu().float()
         feature_sum = values.sum(dim=0, dtype=torch.float64)
         feature_square_sum = values.square().sum(dim=0, dtype=torch.float64)
         if self.feature_sum is None:
@@ -91,8 +98,8 @@ class StreamingLatentStatistics:
             or self.feature_square_sum is None
         ):
             raise ValueError("Cannot normalize without train split latents")
-        mean = self.feature_sum / self.vector_count
-        variance = self.feature_square_sum / self.vector_count - mean.square()
+        mean = self.feature_sum / self.sample_count
+        variance = self.feature_square_sum / self.sample_count - mean.square()
         return LatentStatistics(
             mean.float(),
             variance.clamp_min(1e-12).sqrt().float().clamp_min(1e-6),
@@ -103,20 +110,29 @@ class StreamingLatentStatistics:
 def compute_train_statistics(latents: Tensor) -> LatentStatistics:
     if latents.ndim != 3 or latents.shape[0] == 0:
         raise ValueError("Expected nonempty [samples, latent_tokens, latent_dim] tensor")
-    flattened = latents.float().reshape(-1, latents.shape[-1])
+    values = latents.float()
     return LatentStatistics(
-        flattened.mean(0), flattened.std(0, unbiased=False).clamp_min(1e-6), latents.shape[0]
+        values.mean(0), values.std(0, unbiased=False).clamp_min(1e-6), latents.shape[0]
     )
 
 
 def save_statistics(stats: LatentStatistics, directory: Path) -> str:
+    mean = stats.mean.detach().cpu().contiguous()
+    std = stats.std.detach().cpu().contiguous()
+    if mean.ndim != 2 or mean.shape != std.shape:
+        raise ValueError("Per-token latent statistics must have matching [tokens, dim] shapes")
     directory.mkdir(parents=True, exist_ok=True)
-    torch.save(stats.mean, directory / "latent_mean.pt")
-    torch.save(stats.std, directory / "latent_std.pt")
-    digest = hashlib.sha256(stats.mean.numpy().tobytes() + stats.std.numpy().tobytes()).hexdigest()
+    torch.save(mean, directory / "latent_mean.pt")
+    torch.save(std, directory / "latent_std.pt")
+    digest = hashlib.sha256(
+        NORMALIZATION_SCHEMA_VERSION.encode() + mean.numpy().tobytes() + std.numpy().tobytes()
+    ).hexdigest()
     payload = {
         "train_samples": stats.count,
-        "latent_dim": stats.mean.numel(),
+        "latent_tokens": mean.shape[0],
+        "latent_dim": mean.shape[1],
+        "normalization_shape": list(mean.shape),
+        "normalization_schema_version": NORMALIZATION_SCHEMA_VERSION,
         "normalization_hash": digest,
     }
     (directory / "latent_stats.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -125,8 +141,18 @@ def save_statistics(stats: LatentStatistics, directory: Path) -> str:
 
 def load_statistics(directory: Path) -> LatentStatistics:
     payload = json.loads((directory / "latent_stats.json").read_text(encoding="utf-8"))
+    if payload.get("normalization_schema_version") != NORMALIZATION_SCHEMA_VERSION:
+        raise ValueError(
+            f"Latent cache uses obsolete normalization; rebuild it with "
+            f"{NORMALIZATION_SCHEMA_VERSION}"
+        )
+    mean = torch.load(directory / "latent_mean.pt", weights_only=True)
+    std = torch.load(directory / "latent_std.pt", weights_only=True)
+    expected_shape = tuple(int(value) for value in payload.get("normalization_shape", ()))
+    if mean.ndim != 2 or mean.shape != std.shape or tuple(mean.shape) != expected_shape:
+        raise ValueError("Latent normalization tensors do not match their recorded per-token shape")
     return LatentStatistics(
-        torch.load(directory / "latent_mean.pt", weights_only=True),
-        torch.load(directory / "latent_std.pt", weights_only=True),
+        mean,
+        std,
         int(payload["train_samples"]),
     )

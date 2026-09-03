@@ -10,6 +10,7 @@ import torch
 from omegaconf import DictConfig
 
 from cfmusic.latent.dataset import LatentDataset
+from cfmusic.latent.normalization import NORMALIZATION_SCHEMA_VERSION
 
 
 def _metadata_int(value: object) -> int:
@@ -51,6 +52,11 @@ def validate_latent_dataset(
 ) -> tuple[int, int]:
     """Ensure cache metadata, tensors, codec, and transport agree exactly."""
 
+    if dataset.metadata.get("normalization_schema_version") != NORMALIZATION_SCHEMA_VERSION:
+        raise ValueError(
+            f"The {dataset_name} latent cache predates per-token normalization; rebuild "
+            "cache_latents before transport training"
+        )
     expected_shape = (int(codec_cfg.latent_tokens), int(codec_cfg.latent_dim))
     recorded_shape: tuple[int, int]
     try:

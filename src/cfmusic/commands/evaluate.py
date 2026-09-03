@@ -6,20 +6,26 @@ import json
 from pathlib import Path
 
 import hydra
-import joblib
 import numpy as np
 import pandas as pd
 import torch
 from omegaconf import DictConfig
 
+from cfmusic.conditioning.schema import CONDITION_SCHEMA_VERSION
 from cfmusic.config import CONFIG_DIR, prepare_config
-from cfmusic.data.midi_io import load_midi, validate_midi
-from cfmusic.evaluation.content_preservation import descriptor_preservation, symbolic_descriptors
+from cfmusic.data.midi_io import validate_midi
+from cfmusic.evaluation.clamp2 import (
+    clamp2_style_metrics,
+    extract_clamp2_embeddings,
+    style_prompt,
+)
+from cfmusic.evaluation.content_preservation import (
+    descriptor_preservation,
+    midi_quality_metrics,
+)
 from cfmusic.evaluation.noise_leakage import leakage_metrics, train_temporal_probe
-from cfmusic.evaluation.style_effect import TokenStyleClassifier
-from cfmusic.memory import autocast_context, peak_memory_gib, reset_peak_memory
+from cfmusic.memory import peak_memory_gib, reset_peak_memory
 from cfmusic.progress import track
-from cfmusic.tokenization.factory import tokenizer_from_config
 
 
 def artifact_midi_validity(source: Path, generated: Path) -> dict[str, object]:
@@ -55,40 +61,63 @@ def main(cfg: DictConfig) -> None:
         metadata_files = sorted(artifact_root.rglob("counterfactual_metadata.json"))
     if not metadata_files:
         raise FileNotFoundError(f"No generated artifacts found under {artifact_root}")
-    descriptor_path = (
-        paths["checkpoints_dir"]
-        / "evaluators"
-        / data_name
-        / str(cfg.task)
-        / "descriptor_mlp.joblib"
-    )
-    descriptor_evaluator = joblib.load(descriptor_path) if descriptor_path.exists() else None
-    transformer_path = (
-        paths["checkpoints_dir"] / "evaluators" / data_name / str(cfg.task) / "transformer.pt"
-    )
-    tokenizer = tokenizer_from_config(cfg.tokenizer)
-    transformer_evaluator: TokenStyleClassifier | None = None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reset_peak_memory(device)
-    if transformer_path.exists():
-        transformer_checkpoint = torch.load(
-            transformer_path, map_location="cpu", weights_only=False
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in metadata_files]
+    incompatible = [
+        str(path)
+        for path, record in zip(metadata_files, records, strict=True)
+        if record.get("condition_schema_version") != CONDITION_SCHEMA_VERSION
+    ]
+    if incompatible:
+        raise ValueError(
+            "Generated artifacts use an obsolete condition schema; regenerate them before "
+            f"evaluation (first incompatible artifact: {incompatible[0]})"
         )
-        evaluator_config = transformer_checkpoint["config"]
-        evaluator_state = transformer_checkpoint["model"]
-        output_weight = evaluator_state["output.weight"]
-        transformer_evaluator = TokenStyleClassifier(
-            len(tokenizer.vocabulary),
-            int(output_weight.shape[0]),
-            d_model=int(evaluator_config["d_model"]),
-            layers=int(evaluator_config["layers"]),
-            heads=int(evaluator_config["heads"]),
-            dropout=float(evaluator_config["dropout"]),
-            max_length=int(cfg.tokenizer.max_sequence_length),
-            gradient_checkpointing=bool(evaluator_config.get("gradient_checkpointing", False)),
-        ).to(device)
-        transformer_evaluator.load_state_dict(evaluator_state)
-        transformer_evaluator.eval()
+    clamp_cfg = cfg.evaluation.clamp2
+    clamp_embeddings: dict[str, np.ndarray] = {}
+    style_embeddings: list[np.ndarray] = []
+    if bool(clamp_cfg.enabled):
+        card = json.loads(
+            (paths["processed_dir"] / data_name / "dataset_card.json").read_text(encoding="utf-8")
+        )
+        factorial_axes = {
+            str(record["factorial_intervention"])
+            for record in records
+            if record.get("factorial_intervention") is not None
+        }
+        if len(factorial_axes) > 1:
+            raise ValueError("One evaluation run cannot mix factorial intervention axes")
+        vocabulary_key = (
+            f"{next(iter(factorial_axes))}_vocabulary" if factorial_axes else "style_vocabulary"
+        )
+        style_labels = [str(value) for value in card[vocabulary_key]]
+        midi_files: dict[str, Path] = {}
+        for index, (metadata_path, _metadata) in enumerate(
+            zip(metadata_files, records, strict=True)
+        ):
+            generated = metadata_path.parent / "counterfactual.mid"
+            if validate_midi(generated).valid:
+                midi_files[f"generated-{index:08d}"] = generated
+        template = str(clamp_cfg.style_template)
+        prompts = {
+            f"style-{index:04d}": style_prompt(label, template)
+            for index, label in enumerate(style_labels)
+        }
+        clamp_embeddings = extract_clamp2_embeddings(
+            repository=Path(str(clamp_cfg.repository)).expanduser().resolve(),
+            midi_files=midi_files,
+            texts=prompts,
+            python_executable=(
+                str(clamp_cfg.python_executable)
+                if clamp_cfg.get("python_executable") is not None
+                else None
+            ),
+            cache_dir=Path(str(clamp_cfg.cache_dir)).expanduser().resolve(),
+        )
+        style_embeddings = [
+            clamp_embeddings[f"style-{index:04d}"] for index in range(len(style_labels))
+        ]
     rows: list[dict[str, object]] = []
     noise_by_sample: dict[str, tuple[torch.Tensor, int]] = {}
     invalid_generated_midis = 0
@@ -98,8 +127,9 @@ def main(cfg: DictConfig) -> None:
         total=len(metadata_files),
         unit="transition",
     )
-    for metadata_path in evaluation_progress:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for artifact_index, (metadata_path, metadata) in enumerate(
+        zip(evaluation_progress, records, strict=True)
+    ):
         directory = metadata_path.parent
         source, generated = directory / "source.mid", directory / "counterfactual.mid"
         metrics = artifact_midi_validity(source, generated)
@@ -107,54 +137,19 @@ def main(cfg: DictConfig) -> None:
         generated_is_valid = bool(metrics["generated_midi_valid"])
         if not generated_is_valid:
             invalid_generated_midis += 1
+        if generated_is_valid:
+            metrics.update(midi_quality_metrics(generated))
         if source_is_valid and generated_is_valid:
             metrics.update(descriptor_preservation(source, generated))
-        if descriptor_evaluator is not None:
-            target_id = int(metadata["target_style_id"])
-            if generated_is_valid:
-                probabilities = descriptor_evaluator.predict_proba(
-                    symbolic_descriptors(load_midi(generated))[None]
-                )[0]
-                if target_id < len(probabilities):
-                    metrics["descriptor_target_style_probability"] = float(
-                        probabilities[target_id]
-                    )
-                    metrics["descriptor_target_style_success"] = float(
-                        probabilities.argmax() == target_id
-                    )
-            else:
-                metrics["descriptor_target_style_probability"] = 0.0
-                metrics["descriptor_target_style_success"] = 0.0
-        if transformer_evaluator is not None and generated_is_valid:
-            token_ids = tokenizer.encode(load_midi(generated))
-            token_tensor = torch.tensor([token_ids], dtype=torch.long, device=device)
-            with (
-                torch.inference_mode(),
-                autocast_context(device, str(cfg.evaluator.inference.precision)),
-            ):
-                transformer_probabilities = (
-                    transformer_evaluator(
-                        token_tensor, token_tensor.ne(tokenizer.vocabulary.pad_id)
-                    )
-                    .softmax(-1)[0]
-                    .float()
+        if generated_is_valid and style_embeddings:
+            metrics.update(
+                clamp2_style_metrics(
+                    clamp_embeddings[f"generated-{artifact_index:08d}"],
+                    style_embeddings=style_embeddings,
+                    source_style_id=int(metadata["source_style_id"]),
+                    target_style_id=int(metadata["target_style_id"]),
                 )
-            target_id = int(metadata["target_style_id"])
-            if target_id < transformer_probabilities.numel():
-                metrics["transformer_target_style_probability"] = float(
-                    transformer_probabilities[target_id]
-                )
-                metrics["transformer_target_style_success"] = float(
-                    int(transformer_probabilities.argmax()) == target_id
-                )
-                if "descriptor_target_style_success" in metrics:
-                    metrics["classifier_agreement"] = float(
-                        metrics["descriptor_target_style_success"]
-                        == metrics["transformer_target_style_success"]
-                    )
-        elif transformer_evaluator is not None:
-            metrics["transformer_target_style_probability"] = 0.0
-            metrics["transformer_target_style_success"] = 0.0
+            )
         row: dict[str, object] = {**metadata, **metrics}
         rows.append(row)
         sample_id = str(metadata["sample_id"])

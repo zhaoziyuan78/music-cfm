@@ -2,6 +2,7 @@ from cfmusic.data.samplers import (
     BalancedStyleBatchSampler,
     DatasetTemperatureLengthBatchSampler,
     DistributedBatchSampler,
+    GroupedLengthBatchSampler,
     LengthBucketBatchSampler,
     ShardBatchSampler,
 )
@@ -27,6 +28,22 @@ def test_length_bucket_sampler_epoch_changes_batch_order() -> None:
 
     assert {frozenset(batch) for batch in first} == {frozenset(batch) for batch in second}
     assert first != second
+
+
+def test_grouped_length_sampler_preserves_source_locality_and_reduces_padding() -> None:
+    lengths = [8, 10, 9, 90, 100, 95, 11, 12, 10, 91, 99, 94]
+    groups = ["short-a"] * 3 + ["long-a"] * 3 + ["short-b"] * 3 + ["long-b"] * 3
+    sampler = GroupedLengthBatchSampler(lengths, group_ids=groups, batch_size=6)
+    batches = list(sampler)
+
+    assert sorted(index for batch in batches for index in batch) == list(range(len(lengths)))
+    assert all(len(batch) <= 6 for batch in batches)
+    for batch in batches:
+        positions: dict[str, list[int]] = {}
+        for position, index in enumerate(batch):
+            positions.setdefault(groups[index], []).append(position)
+        assert all(values == list(range(values[0], values[-1] + 1)) for values in positions.values())
+    assert sampler.estimated_attention_efficiency > 0.8
 
 
 def test_distributed_batch_sampler_evenly_shards_and_pads_batches() -> None:
@@ -135,9 +152,21 @@ def test_shard_sampler_keeps_batches_local_and_balances_ranks() -> None:
     )
 
 
-def test_balanced_style_sampler_selects_one_shard_per_class() -> None:
+def test_shard_sampler_uses_one_segment_per_song() -> None:
+    shard_ids = ["a"] * 8
+    sample_ids = [f"song-{index // 2}" for index in range(8)]
+    sampler = ShardBatchSampler(shard_ids, batch_size=4, sample_ids=sample_ids, seed=3)
+
+    batch = next(iter(sampler))
+    assert len(batch) == 4
+    assert len({sample_ids[index] for index in batch}) == 4
+
+
+def test_balanced_style_sampler_selects_unique_songs_per_class() -> None:
     labels = [0] * 8 + [1] * 8
-    groups = ["a"] * 4 + ["b"] * 4 + ["c"] * 4 + ["d"] * 4
+    groups = [
+        f"style-{label}-song-{song}" for label in range(2) for song in range(4) for _ in range(2)
+    ]
     sampler = BalancedStyleBatchSampler(
         labels,
         classes_per_batch=2,
@@ -149,4 +178,4 @@ def test_balanced_style_sampler_selects_one_shard_per_class() -> None:
     for batch in sampler:
         for label in {labels[index] for index in batch}:
             selected_groups = {groups[index] for index in batch if labels[index] == label}
-            assert len(selected_groups) == 1
+            assert len(selected_groups) == 3

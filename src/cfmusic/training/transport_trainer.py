@@ -11,7 +11,7 @@ from typing import cast
 import torch
 from torch import Tensor, nn
 
-from cfmusic.conditioning.schema import ConditionBatch
+from cfmusic.conditioning.schema import ConditionBatch, build_condition_batch
 from cfmusic.distributed import (
     DistributedContext,
     decorrelate_worker_rng,
@@ -22,6 +22,8 @@ from cfmusic.distributed import (
 )
 from cfmusic.latent.dataset import LatentDataset
 from cfmusic.logging import MetricLogger
+from cfmusic.losses.mmd import class_conditional_mmd
+from cfmusic.losses.sliced_wasserstein import class_conditional_sliced_wasserstein
 from cfmusic.memory import (
     autocast_context,
     peak_memory_gib,
@@ -83,12 +85,24 @@ def contrasting_conditions(
     vocabularies: Mapping[str, Sequence[int]],
     *,
     factorial: bool,
+    active_axis: str | None = None,
 ) -> ConditionBatch:
     """Construct wrong, but in-support, labels for condition-discrimination training."""
 
     if factorial and condition.genre_id is not None and condition.emotion_id is not None:
-        genres = _different_labels(condition.genre_id, vocabularies["genre_id"])
-        emotions = _different_labels(condition.emotion_id, vocabularies["emotion_id"])
+        axis = active_axis or "genre"
+        if axis not in {"genre", "emotion"}:
+            raise ValueError("Factorial wrong condition must select exactly one active axis")
+        genres = (
+            _different_labels(condition.genre_id, vocabularies["genre_id"])
+            if axis == "genre"
+            else condition.genre_id
+        )
+        emotions = (
+            _different_labels(condition.emotion_id, vocabularies["emotion_id"])
+            if axis == "emotion"
+            else condition.emotion_id
+        )
         return ConditionBatch(
             condition.dataset_id,
             condition.task_id,
@@ -111,6 +125,7 @@ def shifted_conditions(
     *,
     offset: int,
     factorial: bool,
+    active_axis: str | None = None,
 ) -> ConditionBatch:
     """Deterministically shift labels for reproducible held-out comparisons."""
 
@@ -125,12 +140,17 @@ def shifted_conditions(
         return labels[(positions + offset) % labels.numel()]
 
     if factorial and condition.genre_id is not None and condition.emotion_id is not None:
+        axis = active_axis or "genre"
+        if axis not in {"genre", "emotion"}:
+            raise ValueError("Factorial validation must select exactly one active axis")
         return ConditionBatch(
             condition.dataset_id,
             condition.task_id,
             condition.style_id,
-            shift(condition.genre_id, "genre_id"),
-            shift(condition.emotion_id, "emotion_id"),
+            shift(condition.genre_id, "genre_id") if axis == "genre" else condition.genre_id,
+            shift(condition.emotion_id, "emotion_id")
+            if axis == "emotion"
+            else condition.emotion_id,
         )
     return ConditionBatch(
         condition.dataset_id,
@@ -158,15 +178,24 @@ def heldout_condition_batch(
     dataset: LatentDataset,
     *,
     samples_per_style: int,
+    task: str = "genre",
+    factorial: bool = False,
+    active_axis: str | None = None,
 ) -> dict[str, Tensor]:
     """Load a small balanced probe while touching only one shard per style."""
 
     if samples_per_style <= 0:
         raise ValueError("validation_samples_per_style must be positive")
+    requested_column = f"{active_axis or 'genre'}_id" if factorial else f"{task}_id"
+    balance_column = requested_column if requested_column in dataset.frame else "style_id"
+    if balance_column not in dataset.frame:
+        raise ValueError(f"Validation cache is missing condition column {balance_column!r}")
     selected: list[int] = []
-    for _style, group in dataset.frame.groupby("style_id", sort=True):
+    for _style, group in dataset.frame.groupby(balance_column, sort=True):
         shard = str(group["shard"].astype(str).value_counts().index[0])
         local = group.loc[group["shard"].astype(str) == shard]
+        if "sample_id" in local:
+            local = local.loc[~local["sample_id"].astype(str).duplicated()]
         selected.extend(int(index) for index in local.index[:samples_per_style])
     items = [
         dataset[index]
@@ -204,6 +233,8 @@ def evaluate_condition_following(
     precision: str,
     sdpa_backend: str,
     factorial_conditioning: bool,
+    condition_task: str,
+    active_axis: str | None,
     condition_vocabularies: Mapping[str, Sequence[int]],
     condition_contrast_margin: float,
     condition_contrast_samples: int | None,
@@ -215,15 +246,12 @@ def evaluate_condition_following(
     if not isinstance(latent_value, Tensor):
         raise TypeError("Condition validation batch requires tensor latent")
     latent = latent_value.to(device, non_blocking=True)
-    condition = conditions_from_batch(batch, device, factorial=factorial_conditioning)
+    condition = conditions_from_batch(
+        batch, device, task=condition_task, factorial=factorial_conditioning
+    )
     if factorial_conditioning:
-        comparison_count = (
-            min(
-                len(condition_vocabularies["genre_id"]),
-                len(condition_vocabularies["emotion_id"]),
-            )
-            - 1
-        )
+        axis = active_axis or "genre"
+        comparison_count = len(condition_vocabularies[f"{axis}_id"]) - 1
     else:
         comparison_count = len(condition_vocabularies["style_id"]) - 1
     if comparison_count <= 0:
@@ -251,6 +279,7 @@ def evaluate_condition_following(
                 condition_vocabularies,
                 offset=offset,
                 factorial=factorial_conditioning,
+                active_axis=active_axis,
             )
             # Every wrong-label comparison sees exactly the same random path.
             with torch.random.fork_rng(devices=cuda_devices):
@@ -274,27 +303,89 @@ def evaluate_condition_following(
     return {f"validation_{name}": value / comparison_count for name, value in totals.items()}
 
 
+@torch.no_grad()
+def evaluate_endpoint_matching(
+    transport: nn.Module,
+    batch: Mapping[str, Tensor | str | int],
+    *,
+    device: torch.device,
+    precision: str,
+    sdpa_backend: str,
+    factorial_conditioning: bool,
+    condition_task: str,
+    active_axis: str | None,
+    num_steps: int,
+    seed: int,
+) -> dict[str, float]:
+    """Compare true conditional endpoints, without constructing invalid flow pairs."""
+
+    latent_value = batch["latent"]
+    if not isinstance(latent_value, Tensor):
+        raise TypeError("Endpoint validation batch requires tensor latent")
+    latent = latent_value.to(device, non_blocking=True)
+    condition = conditions_from_batch(
+        batch, device, task=condition_task, factorial=factorial_conditioning
+    )
+    if factorial_conditioning:
+        axis = active_axis or "genre"
+        label = condition.genre_id if axis == "genre" else condition.emotion_id
+        if label is None:
+            raise ValueError(f"Factorial endpoint validation has no {axis} labels")
+    else:
+        label = condition.style_id
+    generator = torch.Generator(device=device).manual_seed(seed)
+    noise = torch.randn(latent.shape, generator=generator, device=device, dtype=latent.dtype)
+    was_training = transport.training
+    transport.eval()
+    try:
+        with sdpa_kernel_context(device, sdpa_backend), autocast_context(device, precision):
+            generated = cast(ConditionalTransport, transport).predict(
+                noise, condition, num_steps=num_steps
+            )
+        flat_generated = generated.float().flatten(1)
+        flat_factual = latent.float().flatten(1)
+        mmd = class_conditional_mmd(flat_generated, flat_factual, label)
+        swd = class_conditional_sliced_wasserstein(
+            flat_generated, flat_factual, label, num_projections=32, seed=seed + 1
+        )
+    finally:
+        transport.train(was_training)
+    return {
+        "endpoint_mmd": float(mmd),
+        "endpoint_swd": float(swd),
+    }
+
+
+def evaluate_raw_and_ema(
+    transport: nn.Module,
+    ema: ExponentialMovingAverage | None,
+    evaluator: object,
+) -> dict[str, float]:
+    """Run a zero-argument evaluator for both weight variants."""
+
+    if not callable(evaluator):
+        raise TypeError("Validation evaluator must be callable")
+    raw = evaluator()
+    if not isinstance(raw, Mapping):
+        raise TypeError("Validation evaluator must return a mapping")
+    metrics = {f"validation_raw_{name}": float(value) for name, value in raw.items()}
+    if ema is not None:
+        with ema.average_parameters(transport):
+            averaged = evaluator()
+        if not isinstance(averaged, Mapping):
+            raise TypeError("Validation evaluator must return a mapping")
+        metrics.update({f"validation_ema_{name}": float(value) for name, value in averaged.items()})
+    return metrics
+
+
 def conditions_from_batch(
     batch: Mapping[str, Tensor | str | int],
     device: torch.device,
     *,
+    task: str = "genre",
     factorial: bool = False,
 ) -> ConditionBatch:
-    styles = batch["style_id"]
-    datasets = batch["dataset_id"]
-    if not isinstance(styles, Tensor) or not isinstance(datasets, Tensor):
-        raise TypeError("Transport batches require tensor style_id and dataset_id")
-    styles = styles.to(device, non_blocking=True)
-    datasets = datasets.to(device, non_blocking=True)
-    genre = batch.get("genre_id")
-    emotion = batch.get("emotion_id")
-    return ConditionBatch(
-        datasets,
-        torch.zeros_like(styles),
-        torch.zeros_like(styles) if factorial else styles,
-        genre.to(device, non_blocking=True) if isinstance(genre, Tensor) else None,
-        emotion.to(device, non_blocking=True) if isinstance(emotion, Tensor) else None,
-    )
+    return build_condition_batch(batch, device, task=task, factorial=factorial)
 
 
 def train_transport_steps(
@@ -318,6 +409,8 @@ def train_transport_steps(
     log_interval: int = 10,
     find_unused_parameters: bool = False,
     factorial_conditioning: bool = False,
+    condition_task: str = "genre",
+    factorial_active_axis: str | None = None,
     condition_contrast_weight: float = 0.0,
     condition_contrast_margin: float = 0.0,
     condition_contrast_samples: int | None = None,
@@ -325,6 +418,7 @@ def train_transport_steps(
     style_loss_weights: Mapping[int, float] | None = None,
     validation_batch: Mapping[str, Tensor | str | int] | None = None,
     validation_seed: int = 2026,
+    validation_solver_steps: int = 8,
     resume_from: Path | None = None,
     distributed: DistributedContext | None = None,
 ) -> TrainState:
@@ -399,12 +493,15 @@ def train_transport_steps(
             if not isinstance(latent, Tensor):
                 raise TypeError("Transport batch requires tensor latent")
             latent = latent.to(device, non_blocking=True)
-            condition = conditions_from_batch(batch, device, factorial=factorial_conditioning)
+            condition = conditions_from_batch(
+                batch, device, task=condition_task, factorial=factorial_conditioning
+            )
             negative_condition = (
                 contrasting_conditions(
                     condition,
                     condition_vocabularies,
                     factorial=factorial_conditioning,
+                    active_axis=factorial_active_axis,
                 )
                 if condition_contrast_weight > 0 and condition_vocabularies is not None
                 else None
@@ -481,17 +578,21 @@ def train_transport_steps(
                     and state.global_step % checkpoint_interval == 0
                 ):
                     metrics.update(
-                        evaluate_condition_following(
+                        evaluate_raw_and_ema(
                             transport,
-                            validation_batch,
-                            device=device,
-                            precision=precision,
-                            sdpa_backend=sdpa_backend,
-                            factorial_conditioning=factorial_conditioning,
-                            condition_vocabularies=condition_vocabularies,
-                            condition_contrast_margin=condition_contrast_margin,
-                            condition_contrast_samples=condition_contrast_samples,
-                            seed=validation_seed,
+                            ema,
+                            lambda: evaluate_endpoint_matching(
+                                transport,
+                                validation_batch,
+                                device=device,
+                                precision=precision,
+                                sdpa_backend=sdpa_backend,
+                                factorial_conditioning=factorial_conditioning,
+                                condition_task=condition_task,
+                                active_axis=factorial_active_axis,
+                                num_steps=validation_solver_steps,
+                                seed=validation_seed,
+                            ),
                         )
                     )
                 if logger is not None:

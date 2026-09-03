@@ -12,29 +12,34 @@ from torch import Tensor, nn
 
 from cfmusic.distributed import (
     DistributedContext,
+    all_gather_tensor,
     decorrelate_worker_rng,
+    differentiable_all_gather,
     distributed_barrier,
     distributed_model,
     set_data_epoch,
 )
 from cfmusic.logging import MetricLogger
+from cfmusic.losses.adversarial import adversarial_style_loss
 from cfmusic.losses.hsic import normalized_hsic
-from cfmusic.losses.prior_matching import classwise_prior_matching
+from cfmusic.losses.mmd import cross_class_mmd
 from cfmusic.losses.roundtrip import roundtrip_loss
+from cfmusic.losses.sliced_wasserstein import sliced_wasserstein_standard_normal
 from cfmusic.memory import (
     autocast_context,
     peak_memory_gib,
     reset_peak_memory,
     sdpa_kernel_context,
 )
-from cfmusic.models.probes import FixedNoiseProjector
+from cfmusic.models.probes import DynamicNoiseProjector
 from cfmusic.progress import progress_bar
 from cfmusic.training.checkpointing import load_checkpoint, save_rolling_checkpoint
 from cfmusic.training.state import ExponentialMovingAverage, TrainState
 from cfmusic.training.transport_trainer import (
     conditions_from_batch,
     contrasting_conditions,
-    evaluate_condition_following,
+    evaluate_endpoint_matching,
+    evaluate_raw_and_ema,
 )
 from cfmusic.transport.base import ConditionalTransport
 
@@ -45,17 +50,88 @@ def regularization_scale(step: int, *, warmup_steps: int, ramp_steps: int) -> fl
     return min(1.0, (step - warmup_steps + 1) / max(1, ramp_steps))
 
 
+@torch.no_grad()
+def evaluate_abduction_exogeneity(
+    transport: nn.Module,
+    projector: DynamicNoiseProjector,
+    batch: Mapping[str, Tensor | str | int],
+    *,
+    device: torch.device,
+    precision: str,
+    sdpa_backend: str,
+    factorial_conditioning: bool,
+    condition_task: str,
+    inverse_steps: int,
+    seed: int,
+) -> dict[str, float]:
+    """Evaluate held-out noise with a projector stream never used for training."""
+
+    latent_value = batch["latent"]
+    if not isinstance(latent_value, Tensor):
+        raise TypeError("Exogeneity validation requires tensor latent")
+    latent = latent_value.to(device, non_blocking=True)
+    condition = conditions_from_batch(
+        batch, device, task=condition_task, factorial=factorial_conditioning
+    )
+    was_training = transport.training
+    transport.eval()
+    try:
+        with sdpa_kernel_context(device, sdpa_backend), autocast_context(device, precision):
+            transport_api = cast(ConditionalTransport, transport)
+            noise = transport_api.abduct(latent, condition, num_steps=inverse_steps)
+            reconstruction = transport_api.predict(noise, condition, num_steps=inverse_steps)
+        views = projector(noise, step=seed, validation=True)
+        labels: tuple[Tensor, ...]
+        if (
+            factorial_conditioning
+            and condition.genre_id is not None
+            and condition.emotion_id is not None
+        ):
+            labels = (condition.genre_id, condition.emotion_id)
+        else:
+            labels = (condition.style_id,)
+        hsic = torch.stack(
+            [normalized_hsic(view, label) for view in views for label in labels]
+        ).mean()
+        cross_mmd = torch.stack(
+            [cross_class_mmd(view, label) for view in views for label in labels]
+        ).mean()
+        gaussian_views = (*views[: projector.num_views], views[-1])
+        prior = torch.stack(
+            [
+                sliced_wasserstein_standard_normal(
+                    view, num_projections=32, seed=seed * 101 + index
+                )
+                for index, view in enumerate(gaussian_views)
+            ]
+        ).mean()
+        roundtrip = roundtrip_loss(reconstruction.float(), latent.float(), 0.1)
+    finally:
+        transport.train(was_training)
+    return {
+        "noise_hsic": float(hsic),
+        "noise_swd": float(prior),
+        "noise_cross_class_mmd": float(cross_mmd),
+        "roundtrip_loss": float(roundtrip),
+    }
+
+
 class AbductionLossModule(nn.Module):
     """Run the complete Stage-2 objective inside one DDP forward pass."""
 
-    _projector: FixedNoiseProjector
+    _adversary: nn.Module | None
 
-    def __init__(self, transport: nn.Module, projector: FixedNoiseProjector) -> None:
+    def __init__(
+        self,
+        transport: nn.Module,
+        projector: DynamicNoiseProjector,
+        adversary: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.transport = transport
-        # The projector is already registered below ``transport``.  A raw reference
-        # avoids registering the same module twice in the DDP wrapper hierarchy.
-        self.__dict__["_projector"] = projector
+        self.projector = projector
+        # The optional adversary is registered on transport for checkpointing.
+        self.__dict__["_adversary"] = adversary
 
     def forward(
         self,
@@ -68,12 +144,15 @@ class AbductionLossModule(nn.Module):
         regularization: float,
         hsic_weight: float,
         prior_weight: float,
+        cross_class_weight: float,
+        adversarial_weight: float,
         roundtrip_weight: float,
         cosine_weight: float,
         negative_condition: object | None,
         condition_contrast_weight: float,
         condition_contrast_margin: float,
         condition_contrast_samples: int | None,
+        global_step: int,
     ) -> dict[str, Tensor]:
         from cfmusic.conditioning.schema import ConditionBatch
 
@@ -91,8 +170,14 @@ class AbductionLossModule(nn.Module):
             condition_contrast_samples=condition_contrast_samples,
         )
         total = base_losses["loss"]
+        if self._adversary is not None:
+            # The adversary is evaluated only on abduction steps.  Keep all of its
+            # parameters in the static DDP graph on intervening base-loss steps.
+            total = total + sum(parameter.sum() * 0.0 for parameter in self._adversary.parameters())
         hsic = latent.new_zeros(())
         prior = latent.new_zeros(())
+        cross_mmd = latent.new_zeros(())
+        adversarial = latent.new_zeros(())
         roundtrip = latent.new_zeros(())
         if run_abduction:
             noise = transport_api.abduct(
@@ -101,31 +186,60 @@ class AbductionLossModule(nn.Module):
             reconstruction = transport_api.predict(
                 noise, condition, num_steps=inverse_steps, track_grad=True
             )
-            projected = self._projector(noise)
+            views = self.projector(noise, step=global_step)
+            labels: tuple[Tensor, ...]
             if (
                 factorial_conditioning
                 and condition.genre_id is not None
                 and condition.emotion_id is not None
             ):
-                hsic = normalized_hsic(projected, condition.genre_id) + normalized_hsic(
-                    projected, condition.emotion_id
-                )
-                prior = 0.5 * (
-                    classwise_prior_matching(projected, condition.genre_id)
-                    + classwise_prior_matching(projected, condition.emotion_id)
-                )
+                labels = (condition.genre_id, condition.emotion_id)
             else:
-                hsic = normalized_hsic(projected, condition.style_id)
-                prior = classwise_prior_matching(projected, condition.style_id)
+                labels = (condition.style_id,)
+            global_labels = tuple(all_gather_tensor(label) for label in labels)
+            global_views = tuple(differentiable_all_gather(view) for view in views)
+            hsic_terms = [
+                normalized_hsic(view, label) for view in global_views for label in global_labels
+            ]
+            cross_terms = [
+                cross_class_mmd(view, label) for view in global_views for label in global_labels
+            ]
+            # Rademacher projections and the raw random block preserve N(0,1).
+            # Token standard deviations do not, so the summary view is excluded.
+            gaussian_views = (*global_views[: self.projector.num_views], global_views[-1])
+            prior_terms = [
+                sliced_wasserstein_standard_normal(
+                    view, num_projections=32, seed=global_step * 101 + index
+                )
+                for index, view in enumerate(gaussian_views)
+            ]
+            hsic = torch.stack(hsic_terms).mean()
+            cross_mmd = torch.stack(cross_terms).mean()
+            prior = torch.stack(prior_terms).mean()
+            if adversarial_weight > 0:
+                if self._adversary is None:
+                    raise ValueError("adversarial_weight is positive but no adversary is attached")
+                adversarial = torch.stack(
+                    [
+                        adversarial_style_loss(global_views[0], label, self._adversary)
+                        for label in global_labels
+                    ]
+                ).mean()
             roundtrip = roundtrip_loss(reconstruction, latent, cosine_weight)
             total = total + regularization * (
-                hsic_weight * hsic + prior_weight * prior + roundtrip_weight * roundtrip
+                hsic_weight * hsic
+                + prior_weight * prior
+                + cross_class_weight * cross_mmd
+                + adversarial_weight * adversarial
+                + roundtrip_weight * roundtrip
             )
         results = {
             "loss": total,
             "base_loss": base_losses["loss"],
             "hsic": hsic,
             "prior_loss": prior,
+            "cross_class_mmd": cross_mmd,
+            "adversarial_loss": adversarial,
             "roundtrip_loss": roundtrip,
         }
         for name in (
@@ -141,7 +255,8 @@ class AbductionLossModule(nn.Module):
 
 def finetune_abduction_steps(
     transport: nn.Module,
-    projector: FixedNoiseProjector,
+    projector: DynamicNoiseProjector,
+    adversary: nn.Module | None,
     batches: Iterable[Mapping[str, Tensor | str | int]],
     *,
     optimizer: torch.optim.Optimizer,
@@ -152,6 +267,8 @@ def finetune_abduction_steps(
     inverse_steps: int,
     hsic_weight: float,
     prior_weight: float,
+    cross_class_weight: float,
+    adversarial_weight: float,
     roundtrip_weight: float,
     cosine_weight: float,
     warmup_steps: int,
@@ -164,12 +281,16 @@ def finetune_abduction_steps(
     config: Mapping[str, object],
     provenance: Mapping[str, str],
     factorial_conditioning: bool = False,
+    condition_task: str = "genre",
+    factorial_active_axis: str | None = None,
     condition_contrast_weight: float = 0.0,
     condition_contrast_margin: float = 0.0,
     condition_contrast_samples: int | None = None,
     condition_vocabularies: Mapping[str, Sequence[int]] | None = None,
     validation_batch: Mapping[str, Tensor | str | int] | None = None,
     validation_seed: int = 2026,
+    validation_solver_steps: int = 8,
+    ema_decay: float = 0.999,
     ema_update_interval: int = 10,
     log_interval: int = 10,
     resume_from: Path | None = None,
@@ -187,7 +308,7 @@ def finetune_abduction_steps(
         raise ValueError("Condition contrast requires observed-label vocabularies")
     context = distributed or DistributedContext(0, 0, 1, device)
     state = TrainState()
-    ema = ExponentialMovingAverage(transport)
+    ema = ExponentialMovingAverage(transport, ema_decay)
     use_amp = precision in {"bf16", "fp16"} and device.type == "cuda"
     scaler = torch.GradScaler("cuda", enabled=use_amp and precision == "fp16")
     if resume_from is not None:
@@ -210,9 +331,7 @@ def finetune_abduction_steps(
             )
         state.batch_in_epoch = 0
     state.world_size = context.world_size
-    if getattr(transport, "noise_projector", None) is not projector:
-        raise ValueError("The Stage-2 projector must be registered on the transport")
-    objective = AbductionLossModule(transport, projector)
+    objective = AbductionLossModule(transport, projector, adversary)
     training_model = distributed_model(objective, context)
     decorrelate_worker_rng(context)
     transport.train()
@@ -231,6 +350,8 @@ def finetune_abduction_steps(
     report_regularizers = {
         "hsic": torch.zeros((), device=device),
         "prior_loss": torch.zeros((), device=device),
+        "cross_class_mmd": torch.zeros((), device=device),
+        "adversarial_loss": torch.zeros((), device=device),
         "roundtrip_loss": torch.zeros((), device=device),
     }
     report_conditions = {
@@ -253,12 +374,15 @@ def finetune_abduction_steps(
             if not isinstance(latent_value, Tensor):
                 raise TypeError("Abduction batch requires tensor latent")
             latent = latent_value.to(device, non_blocking=True)
-            condition = conditions_from_batch(batch, device, factorial=factorial_conditioning)
+            condition = conditions_from_batch(
+                batch, device, task=condition_task, factorial=factorial_conditioning
+            )
             negative_condition = (
                 contrasting_conditions(
                     condition,
                     condition_vocabularies,
                     factorial=factorial_conditioning,
+                    active_axis=factorial_active_axis,
                 )
                 if condition_contrast_weight > 0 and condition_vocabularies is not None
                 else None
@@ -278,12 +402,15 @@ def finetune_abduction_steps(
                         ),
                         hsic_weight=hsic_weight,
                         prior_weight=prior_weight,
+                        cross_class_weight=cross_class_weight,
+                        adversarial_weight=adversarial_weight,
                         roundtrip_weight=roundtrip_weight,
                         cosine_weight=cosine_weight,
                         negative_condition=negative_condition,
                         condition_contrast_weight=condition_contrast_weight,
                         condition_contrast_margin=condition_contrast_margin,
                         condition_contrast_samples=condition_contrast_samples,
+                        global_step=state.global_step,
                     )
                     total = losses["loss"]
                 optimizer.zero_grad(set_to_none=True)
@@ -330,6 +457,12 @@ def finetune_abduction_steps(
                     "prior_loss": float(
                         report_regularizers["prior_loss"] / max(1, report_abductions)
                     ),
+                    "cross_class_mmd": float(
+                        report_regularizers["cross_class_mmd"] / max(1, report_abductions)
+                    ),
+                    "adversarial_loss": float(
+                        report_regularizers["adversarial_loss"] / max(1, report_abductions)
+                    ),
                     "roundtrip_loss": float(
                         report_regularizers["roundtrip_loss"] / max(1, report_abductions)
                     ),
@@ -360,17 +493,35 @@ def finetune_abduction_steps(
                     and state.global_step % checkpoint_interval == 0
                 ):
                     metrics.update(
-                        evaluate_condition_following(
+                        evaluate_raw_and_ema(
                             transport,
-                            validation_batch,
-                            device=device,
-                            precision=precision,
-                            sdpa_backend=sdpa_backend,
-                            factorial_conditioning=factorial_conditioning,
-                            condition_vocabularies=condition_vocabularies,
-                            condition_contrast_margin=condition_contrast_margin,
-                            condition_contrast_samples=condition_contrast_samples,
-                            seed=validation_seed,
+                            ema,
+                            lambda: {
+                                **evaluate_endpoint_matching(
+                                    transport,
+                                    validation_batch,
+                                    device=device,
+                                    precision=precision,
+                                    sdpa_backend=sdpa_backend,
+                                    factorial_conditioning=factorial_conditioning,
+                                    condition_task=condition_task,
+                                    active_axis=factorial_active_axis,
+                                    num_steps=validation_solver_steps,
+                                    seed=validation_seed,
+                                ),
+                                **evaluate_abduction_exogeneity(
+                                    transport,
+                                    projector,
+                                    validation_batch,
+                                    device=device,
+                                    precision=precision,
+                                    sdpa_backend=sdpa_backend,
+                                    factorial_conditioning=factorial_conditioning,
+                                    condition_task=condition_task,
+                                    inverse_steps=validation_solver_steps,
+                                    seed=validation_seed,
+                                ),
+                            },
                         )
                     )
                 if logger is not None:

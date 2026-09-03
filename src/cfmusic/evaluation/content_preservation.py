@@ -64,6 +64,54 @@ def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     return float(left @ right / max(1e-12, np.linalg.norm(left) * np.linalg.norm(right)))
 
 
+def _melody_contour(midi: miditoolkit.MidiFile, points: int = 64) -> np.ndarray:
+    """Return a transposition-invariant top-line contour on a fixed grid."""
+
+    by_onset: dict[int, int] = {}
+    for instrument in midi.instruments:
+        if instrument.is_drum:
+            continue
+        for note in instrument.notes:
+            by_onset[note.start] = max(by_onset.get(note.start, 0), note.pitch)
+    if len(by_onset) < 2:
+        return np.zeros(points, dtype=np.float64)
+    melody = np.asarray([by_onset[onset] for onset in sorted(by_onset)], dtype=np.float64)
+    source_grid = np.linspace(0.0, 1.0, num=len(melody))
+    contour = np.interp(np.linspace(0.0, 1.0, num=points), source_grid, melody)
+    contour -= contour.mean()
+    scale = contour.std()
+    return contour / scale if scale > 1e-8 else np.zeros_like(contour)
+
+
+def midi_quality_metrics(midi_or_path: miditoolkit.MidiFile | Path) -> dict[str, float]:
+    """Reference-free structural MIDI quality diagnostics."""
+
+    midi = load_midi(midi_or_path) if isinstance(midi_or_path, Path) else midi_or_path
+    notes = [note for instrument in midi.instruments for note in instrument.notes]
+    if not notes:
+        return {
+            "generated_note_count": 0.0,
+            "generated_duration_beats": 0.0,
+            "generated_note_density": 0.0,
+            "generated_unique_pitch_classes": 0.0,
+            "generated_pitch_range": 0.0,
+            "generated_nonpositive_duration_ratio": 1.0,
+        }
+    ticks = max(1, midi.ticks_per_beat)
+    duration = max(note.end for note in notes) / ticks
+    pitches = np.asarray([note.pitch for note in notes])
+    return {
+        "generated_note_count": float(len(notes)),
+        "generated_duration_beats": float(duration),
+        "generated_note_density": float(len(notes) / max(duration, 1e-6)),
+        "generated_unique_pitch_classes": float(len(set((pitches % 12).tolist()))),
+        "generated_pitch_range": float(pitches.max() - pitches.min()),
+        "generated_nonpositive_duration_ratio": float(
+            np.mean([note.end <= note.start for note in notes])
+        ),
+    }
+
+
 def descriptor_preservation(source: Path, generated: Path) -> dict[str, float]:
     source_midi, generated_midi = load_midi(source), load_midi(generated)
     source_features = symbolic_descriptors(source_midi)
@@ -74,6 +122,9 @@ def descriptor_preservation(source: Path, generated: Path) -> dict[str, float]:
         "descriptor_cosine": cosine_similarity(source_features, generated_features),
         "pitch_class_histogram_cosine": cosine_similarity(
             source_features[:12], generated_features[:12]
+        ),
+        "melody_contour_cosine": cosine_similarity(
+            _melody_contour(source_midi), _melody_contour(generated_midi)
         ),
         "note_density_ratio": len(generated_notes) / max(1, len(source_notes)),
         "tempo_ratio": float(np.mean([x.tempo for x in generated_midi.tempo_changes] or [120]))

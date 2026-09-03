@@ -17,7 +17,7 @@ from cfmusic.distributed import (
 )
 from cfmusic.evaluation.style_effect import TokenStyleClassifier
 from cfmusic.models.latent_vector_field import ConditionalVectorField
-from cfmusic.models.probes import FixedNoiseProjector
+from cfmusic.models.probes import DynamicNoiseProjector
 from cfmusic.reproducibility import seed_everything
 from cfmusic.training.abduction_trainer import finetune_abduction_steps
 from cfmusic.training.codec_trainer import train_codec_steps
@@ -148,12 +148,14 @@ def main() -> None:
             distributed=context,
         )
 
-        projector = FixedNoiseProjector(8, 4, seed=3).to(context.device)
-        transport.add_module("noise_projector", projector)
+        projector = DynamicNoiseProjector(
+            8, 4, num_views=2, seed=3, block_tokens=1, block_channels=2
+        ).to(context.device)
         stage2_optimizer = torch.optim.AdamW(transport.parameters(), lr=1e-4)
         finetune_abduction_steps(
             transport,
             projector,
+            None,
             [latent_batch],
             optimizer=stage2_optimizer,
             scheduler=_scheduler(stage2_optimizer, max_steps),
@@ -163,6 +165,8 @@ def main() -> None:
             inverse_steps=1,
             hsic_weight=1e-3,
             prior_weight=1e-3,
+            cross_class_weight=1e-3,
+            adversarial_weight=0.0,
             roundtrip_weight=1e-2,
             cosine_weight=0.1,
             warmup_steps=0,

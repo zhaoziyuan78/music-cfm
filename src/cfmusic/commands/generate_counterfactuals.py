@@ -21,7 +21,12 @@ from omegaconf import DictConfig
 
 from cfmusic.codec.checkpoint import checkpoint_hash
 from cfmusic.commands.train_codec import codec_from_config
-from cfmusic.conditioning.schema import ConditionBatch
+from cfmusic.conditioning.schema import (
+    CONDITION_SCHEMA_VERSION,
+    ConditionBatch,
+    build_condition_batch,
+    validate_condition_checkpoint,
+)
 from cfmusic.config import CONFIG_DIR, prepare_config
 from cfmusic.data.midi_io import load_midi
 from cfmusic.distributed import (
@@ -200,7 +205,7 @@ def _load_model_state(
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         raise ValueError(f"Checkpoint is missing model parameters: {missing}")
-    invalid = [name for name in unexpected if not name.startswith("noise_projector.")]
+    invalid = [name for name in unexpected if not name.startswith("exogeneity_adversary.")]
     if invalid:
         raise ValueError(f"Unexpected checkpoint parameters: {invalid}")
 
@@ -285,7 +290,10 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
     if not isinstance(transport_checkpoint, dict):
         raise TypeError("Transport checkpoint must contain a mapping")
     validate_transport_cache_provenance(transport_checkpoint, cache_metadata)
-    transport_weights = str(cfg.counterfactual.get("transport_weights", "ema"))
+    factorial = bool(cfg.experiment.get("factorial", False))
+    task = str(cfg.data.get("task", cfg.task))
+    validate_condition_checkpoint(transport_checkpoint, task=task, factorial=factorial)
+    transport_weights = str(cfg.counterfactual.get("transport_weights", "raw"))
     _load_model_state(transport, transport_checkpoint, weights=transport_weights)
     del transport_checkpoint
     transport.eval()
@@ -307,6 +315,7 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
         "codec_checkpoint_hash": codec_checkpoint_digest,
         "transport_checkpoint_hash": transport_checkpoint_digest,
         "transport_weights": transport_weights,
+        "condition_schema_version": CONDITION_SCHEMA_VERSION,
         "generation_config_hash": generation_config_hash,
     }
     card = json.loads(
@@ -314,16 +323,16 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
     )
     labels = list(card["style_vocabulary"])
     styles = sorted(latent_dataset.frame["style_id"].astype(int).unique().tolist())
-    factorial = bool(cfg.experiment.get("factorial", False))
     intervention = str(cfg.counterfactual.factorial_intervention)
+    if factorial and intervention not in {"genre", "emotion"}:
+        raise ValueError(
+            "Factorial counterfactuals must change exactly one axis; run separate genre and "
+            f"emotion interventions instead of factorial_intervention={intervention!r}"
+        )
     if factorial and intervention == "genre":
         strata = ["genre_id"]
     elif factorial and intervention == "emotion":
         strata = ["emotion_id"]
-    elif factorial and intervention == "joint":
-        strata = ["genre_id", "emotion_id"]
-    elif factorial:
-        raise ValueError(f"Unknown factorial intervention: {intervention}")
     else:
         strata = ["style_id"]
     maximum_total = cfg.counterfactual.get("max_total_sources")
@@ -411,8 +420,7 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                     explicit_pairs=explicit_pairs,
                 )
             )
-        count = (len(genre_labels) - 1) * (len(emotion_labels) - 1)
-        return min(count, requested_targets) if requested_targets is not None else count
+        raise ValueError(f"Unsupported factorial intervention: {intervention}")
 
     planned_transition_total = sum(planned_targets(index) for index in selected_indices)
     global_transition_total = sum(planned_targets(index) for index in global_selected_indices)
@@ -435,28 +443,21 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
         item = latent_dataset[index]
         source_style = int(item["style_id"])
         latent = item["latent"]
-        dataset_id = int(item["dataset_id"])
         if not isinstance(latent, torch.Tensor):
             raise TypeError("Invalid latent sample")
         latent = latent[None].to(device)
-        dataset_tensor = torch.tensor([dataset_id], device=device)
-        task_tensor = torch.zeros(1, dtype=torch.long, device=device)
         transitions: list[tuple[ConditionBatch, str, str, int]] = []
+        evaluation_source_style = source_style
         if factorial:
             if "genre_id" not in item or "emotion_id" not in item:
                 raise ValueError("Factorial generation requires cached genre_id and emotion_id")
             source_genre, source_emotion = int(item["genre_id"]), int(item["emotion_id"])
             genre_labels = list(card["genre_vocabulary"])
             emotion_labels = list(card["emotion_vocabulary"])
-            source_condition = ConditionBatch(
-                dataset_tensor,
-                task_tensor,
-                torch.zeros(1, dtype=torch.long, device=device),
-                torch.tensor([source_genre], device=device),
-                torch.tensor([source_emotion], device=device),
-            )
+            source_condition = build_condition_batch(item, device, task=task, factorial=True)
             if intervention in {"genre", "emotion"}:
                 axis_source = source_genre if intervention == "genre" else source_emotion
+                evaluation_source_style = axis_source
                 axis_labels = genre_labels if intervention == "genre" else emotion_labels
                 target_ids = target_style_ids(
                     axis_source,
@@ -472,48 +473,23 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                     target_emotion = target_id if intervention == "emotion" else source_emotion
                     transitions.append(
                         (
-                            ConditionBatch(
-                                dataset_tensor,
-                                task_tensor,
-                                torch.zeros(1, dtype=torch.long, device=device),
-                                torch.tensor([target_genre], device=device),
-                                torch.tensor([target_emotion], device=device),
+                            build_condition_batch(
+                                item,
+                                device,
+                                task=task,
+                                factorial=True,
+                                genre_id=target_genre,
+                                emotion_id=target_emotion,
                             ),
                             axis_labels[axis_source],
                             axis_labels[target_id],
                             target_id,
                         )
                     )
-            elif intervention == "joint":
-                candidates = [
-                    (genre, emotion)
-                    for genre in range(len(genre_labels))
-                    for emotion in range(len(emotion_labels))
-                    if genre != source_genre and emotion != source_emotion
-                ]
-                if requested_targets is not None:
-                    candidates = candidates[:requested_targets]
-                for target_genre, target_emotion in candidates:
-                    transitions.append(
-                        (
-                            ConditionBatch(
-                                dataset_tensor,
-                                task_tensor,
-                                torch.zeros(1, dtype=torch.long, device=device),
-                                torch.tensor([target_genre], device=device),
-                                torch.tensor([target_emotion], device=device),
-                            ),
-                            f"{genre_labels[source_genre]}+{emotion_labels[source_emotion]}",
-                            f"{genre_labels[target_genre]}+{emotion_labels[target_emotion]}",
-                            target_genre * len(emotion_labels) + target_emotion,
-                        )
-                    )
             else:
                 raise ValueError(f"Unknown factorial intervention: {intervention}")
         else:
-            source_condition = ConditionBatch(
-                dataset_tensor, task_tensor, torch.tensor([source_style], device=device)
-            )
+            source_condition = build_condition_batch(item, device, task=task, factorial=False)
             target_ids = target_style_ids(
                 source_style,
                 styles,
@@ -530,8 +506,12 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 )
                 transitions.append(
                     (
-                        ConditionBatch(
-                            dataset_tensor, task_tensor, torch.tensor([target_style], device=device)
+                        build_condition_batch(
+                            item,
+                            device,
+                            task=task,
+                            factorial=False,
+                            active_id=target_style,
                         ),
                         source_name,
                         target_name,
@@ -695,7 +675,7 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 "segment_id": segment_id,
                 "dataset": data_name,
                 "source_style": source_name,
-                "source_style_id": source_style,
+                "source_style_id": evaluation_source_style,
                 "target_style": target_name,
                 "target_style_id": target_style,
                 "factorial_intervention": intervention if factorial else None,

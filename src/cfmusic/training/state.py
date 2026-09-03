@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
@@ -48,3 +50,15 @@ class ExponentialMovingAverage:
         if not isinstance(shadow, dict):
             raise TypeError("Invalid EMA state")
         self.shadow = shadow
+
+    @contextmanager
+    @torch.no_grad()
+    def average_parameters(self, model: nn.Module) -> Iterator[None]:
+        """Temporarily evaluate EMA weights, then restore exact raw weights."""
+
+        raw = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+        try:
+            yield
+        finally:
+            model.load_state_dict(raw)

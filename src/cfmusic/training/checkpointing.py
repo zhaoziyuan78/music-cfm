@@ -76,7 +76,7 @@ def save_checkpoint(
     provenance: Mapping[str, str],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, object] = {
         "model": model.state_dict(),
         "ema_model": ema.state_dict() if ema else None,
         "optimizer": optimizer.state_dict(),
@@ -94,6 +94,8 @@ def save_checkpoint(
         "config": dict(config),
         "provenance": dict(provenance),
     }
+    if "condition_schema_version" in provenance:
+        payload["condition_schema_version"] = provenance["condition_schema_version"]
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)

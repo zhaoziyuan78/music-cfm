@@ -208,7 +208,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/evaluate_codec_checkpoint.py \
   --output reports/codec_evaluation/xmidi.json
 ```
 
-Transport always uses the frozen posterior mean. Cache it with train-only feature statistics and provenance hashes:
+Transport always uses the frozen posterior mean. Cache it with train-only **per-token** feature
+statistics and provenance hashes:
 
 The pitched CFM, OT-CFM, DDIM, split-transport, Stage-2, and generation profiles all consume the
 current `64 x 512` BEAT latent. Old `32 x 256` caches and transport checkpoints are intentionally
@@ -233,9 +234,18 @@ normalization statistics, and atomically publishes the completed cache. The prio
 usable until the new one is complete. On four A100 40G GPUs the default encoder batch is 384 per
 GPU (about 23.3 GiB in a worst-case 2560-token test), with 32 total data-loader workers. The cache
 uses the same overlength exclusion as VAE training and records codec/tokenizer/manifest hashes,
-weight variant, latent shape, dtype, and normalization hash. XMIDI's roughly 1.93 million valid
+weight variant, latent shape, dtype, normalization schema, and normalization hash. Mean and
+standard deviation have shape `64 x 512`: each learned VAE query position is normalized
+independently rather than pooling the 64 non-exchangeable tokens into one distribution. Caches
+without `normalization_schema_version=per-token-v2` are rejected. XMIDI's roughly 1.93 million valid
 segments require approximately 118 GiB for raw FP16 latent tensors, plus indexes and serialization
 overhead.
+
+Four-GPU caching partitions each split by estimated quadratic attention cost rather than only by
+row count. Long NFS preparation, rank stragglers, index merging, and atomic publication synchronize
+through build-scoped filesystem markers, so they do not hold an NCCL barrier open past its watchdog
+timeout. `latent_cache.synchronization_timeout_seconds` bounds a genuinely stalled build and
+defaults to two hours.
 
 ## CFM, DDIM, and abduction fine-tuning
 
@@ -259,23 +269,28 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
   paths.data_root=$CFMUSIC_DATA_ROOT
 ```
 
-The XMIDI CFM backbone is a 768-wide, 10-layer AdaLN DiT. Its primary objective remains ordinary
-independent flow matching. A second forward pass over 128 examples per GPU compares the factual
-velocity target under the correct style and an observed, in-support wrong style. A margin loss
-focuses on the low-time/high-noise endpoint where the state carries the least factual style
-information. Its weight is 0.5 and its required MSE gap is 0.10, so it remains active longer
-without overtaking the primary CFM objective. `condition_gap`, `condition_accuracy`,
-`condition_correct_error`, and `condition_wrong_error` are written to every training log. The main
-loss is also weighted by the square root of inverse class frequency, which raises the contribution
-of XMIDI's smallest style without repeatedly loading or heavily oversampling its examples.
+The XMIDI CFM backbone is a 768-wide, 10-layer AdaLN DiT. Its objective is ordinary independent
+flow matching. The former wrong-condition margin has been removed: a factual flow path paired
+with an incorrect class is not a valid conditional-FM training pair. Conditional endpoint quality
+is instead measured by class-conditional MMD and sliced Wasserstein distance between
+`F_s(epsilon)` and held-out factual latents. The main loss remains weighted by the square root of
+inverse class frequency.
 
-The current `64 x 512` profiles were tested on four A100 40G GPUs with the configured per-GPU
-batches. The enlarged CFM Stage-1 peaks at 20.03 GiB/GPU and sustains about 6,820 samples/second
-globally. Its differentiable Stage-2 worst path peaks at 33.00 GiB/GPU. The unchanged DDIM
-Stage-1/DDIM-FPI Stage-2 profiles remain near 8.3/20.0 GiB. These are complete
-forward/backward/optimizer measurements, including the Stage-2 four-step inverse and round trip.
+All condition construction now goes through schema `task-aware-v2`. A genre run activates
+`dataset + task + style=genre` and sets `genre_id=emotion_id=None`; an emotion run similarly puts
+only emotion in the style slot. A factorial run uses a constant style sentinel and activates only
+the separate genre and emotion slots. A factorial intervention changes exactly one of those axes.
+The schema and task are checkpoint provenance, and resume, Stage-2 initialization, and generation
+reject older checkpoints rather than silently applying incompatible condition semantics.
 
-Stage-2 HSIC + classwise-prior + round-trip fine-tuning:
+The `64 x 512` backbone and batch profiles were measured on four A100 40G GPUs. The enlarged CFM
+Stage 1 peaks at 20.03 GiB/GPU and sustains about 6,820 samples/second globally. The four-step
+differentiable Stage-2 solver/round-trip path measured 33.00 GiB/GPU before this audit; its new
+dynamic projection and gathered-feature tensors add less than 0.1 GiB/GPU by construction, leaving
+over 6 GiB of device headroom. The unchanged DDIM Stage-1/DDIM-FPI Stage-2 profiles remain near
+8.3/20.0 GiB. Confirm the first logged peak on the target driver/PyTorch build before a long run.
+
+Stage-2 multi-view exogeneity + round-trip fine-tuning:
 
 ```bash
 # One A100
@@ -289,15 +304,19 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
   transport_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e20_cfm_base/transport_stage1/last.pt paths.data_root=$CFMUSIC_DATA_ROOT
 ```
 
-Stage-2 initializes from the Stage-1 EMA parameters, runs the differentiable abduction objective
-every two steps, and continues the condition-margin objective. Its HSIC, classwise-prior, and
-round-trip coefficients are scaled so their combined contribution is visible rather than being
-lost below roughly 0.2% of the base loss. Final generation also selects the Stage-2 EMA parameters
-by default; set `counterfactual.transport_weights=raw` only for an explicit raw-vs-EMA ablation.
-At every rolling checkpoint, both stages also evaluate a fixed 96-latent, six-style validation
-probe against all five wrong styles with identical noise and time draws. The resulting
-`validation_condition_*` fields distinguish genuine held-out condition following from merely
-satisfying the margin on current training batches.
+Stage-2 initializes from the Stage-1 EMA parameters and runs differentiable abduction every two
+steps. It uses three independently resampled Rademacher projections, token-wise mean/std, and a
+random token-by-channel block. HSIC, standard-normal sliced Wasserstein, and cross-class MMD are
+computed across those views. Projectors change every step, while validation uses a disjoint seed
+stream. In DDP, differentiable all-gather forms the regularizers on the complete four-GPU batch.
+The balanced sampler is hierarchical (`style -> unique sample_id -> one segment`), so one song can
+appear at most once per class in a batch; Stage 1 likewise chooses one changing segment per song
+pass while retaining shard-local reads and its original optimizer budget.
+
+Stage-2 EMA decay is configurable and defaults to 0.999. At each rolling checkpoint, raw and EMA
+weights are both evaluated for endpoint MMD/SWD, held-out noise HSIC/SWD/cross-class MMD, and
+round-trip loss. Generation defaults to raw weights; select `counterfactual.transport_weights=ema`
+only after comparing these validation fields.
 
 The full XMIDI continuation can be submitted with one Slurm command:
 
@@ -308,9 +327,10 @@ sbatch cfm.sh
 sbatch --export=ALL,CFMUSIC_SKIP_LATENT_CACHE=true,CFMUSIC_CFM_RESUME=true cfm.sh
 ```
 
-The enlarged CFM checkpoint is intentionally architecture-incompatible with older 512-wide,
-8-layer CFM checkpoints. Start this revised Stage-1/Stage-2 pair with
-`CFMUSIC_CFM_RESUME=false`; use `true` only after the revised run has written its own `last.pt`.
+The new per-token normalization and condition schema make every earlier E20/E22 checkpoint and
+latent cache intentionally incompatible. Rebuild XMIDI latents, then start Stage 1 and Stage 2
+with `CFMUSIC_CFM_RESUME=false`; use `true` only after the revised run has written its own
+`last.pt`. The VAE checkpoint itself remains valid.
 
 All torch trainers atomically overwrite one intermediate checkpoint named `last.pt`; they no
 longer retain `step-XXXXXXXX.pt` copies, and the first new save removes legacy step checkpoints in
@@ -335,20 +355,18 @@ resume preserves the optimizer step and safely resets only the within-epoch data
 default profiles target a 40 GiB A100. The long-sequence pitched codec retains activation
 checkpointing and peaks near 30 GiB at batch 32. Stage-1 transport does not checkpoint
 activations: the enlarged CFM processes 512 samples per GPU at 20.03 GiB, while the unchanged
-DDIM profile remains near 8.3 GiB. The balanced Stage-2 batch of 64 peaks at 33.00 GiB for the
-enlarged CFM and about 20.0 GiB for DDIM-FPI; its batch composition is kept fixed because the
-independence losses depend on the number of examples per class. AdamW uses its fused CUDA
-implementation,
-static buffers are not re-broadcast on every DDP forward, and EMA is updated in equivalent ten-step
-chunks. With four GPUs, the global effective batch is the configured per-GPU batch times four (and
-times gradient accumulation).
+DDIM profile remains near 8.3 GiB. The balanced Stage-2 batch stays at 64 per GPU; its dominant CFM
+solver path measured 33.00 GiB before the sub-0.1-GiB dynamic-view addition, while DDIM-FPI is about
+20.0 GiB. Its batch composition is kept fixed because the independence losses depend on examples
+per class. AdamW uses its fused CUDA implementation, dynamic projection matrices are never retained
+in checkpoints, and EMA is updated in equivalent ten-step chunks. With four GPUs, the global
+effective batch is the configured per-GPU batch times four (and times gradient accumulation).
 
 Latent transport training uses `sdpa_backend: math` by default for both Stage 1 and Stage 2 while
 retaining BF16 autocast for the rest of the model. This avoids the severely amplified BF16 fused
 SDPA/Flash-Attention backward gradients observed in trained AdaLN blocks on A100. The latent
-sequence is only 64 tokens, so the math attention matrix remains small. Codec and token-evaluator
-training keep their automatic attention backend because their sequences can reach 2560 and 2048
-tokens, respectively.
+sequence is only 64 tokens, so the math attention matrix remains small. Codec training keeps its
+automatic attention backend because its sequences can reach 2560 tokens.
 The startup plan prints the selected backend; `sdpa_backend=math` should be visible before a new
 transport run begins.
 
@@ -358,11 +376,9 @@ Every training stage writes the same observable logging bundle in its checkpoint
 - `training.log`: compact one-line-per-record text log;
 - `training_curves.png`: an atomically replaced dashboard containing raw and smoothed curves;
 - `tensorboard/events.out.tfevents.*`: TensorBoard scalars;
-- `last.pt` (or `last.joblib` for the descriptor baseline): the rolling resume checkpoint.
+- `last.pt`: the rolling resume checkpoint.
 
-Codec validation writes the same bundle under `validation/`. The descriptor baseline writes its
-bundle under `descriptor_mlp_training/`, so it cannot collide with the Transformer evaluator.
-The post-hoc temporal leakage probe writes its bundle under
+Codec validation writes the same bundle under `validation/`. The post-hoc temporal leakage probe writes its bundle under
 `artifacts/<experiment>/<dataset>/evaluation/temporal_probe_training/`.
 Curves are refreshed periodically during training and once more on clean shutdown. A fresh run
 resets the old scalar logs and TensorBoard events; `resume=true` restores and extends both the
@@ -373,21 +389,15 @@ uv run tensorboard --logdir \
   /l/users/gus.xia/ziyuan/music-scm/checkpoints/e20_cfm_base/transport_stage1/tensorboard
 ```
 
-Latent transport loaders shuffle shards and samples within each shard, then assign complete shard
-runs evenly to ranks. This avoids reloading a roughly 128 MiB latent file for nearly every random
-sample. Stage-2 style-balanced batches select one shard per requested style and use a small mmap LRU
-cache. On the current four-A100 node, the revised XMIDI CFM short run sustained about 0.30
-seconds/step and 6.82k samples/second. The Stage-1 budget is capped at 60 data epochs, 50k optimizer
-steps, and a 5k-step floor; the current four-GPU XMIDI cache therefore schedules about 45.3k steps,
-or roughly 3.8 hours of pure optimizer time at the measured short-run rate. Stage-2 uses 12k steps
-and a four-step differentiable training solver; final generation and evaluation still use the
-configured 32-step solver.
+Latent transport loaders retain locality by visiting only one or two contiguous shards per batch.
+Within that locality, Stage 1 weights songs equally and selects a changing segment from each song;
+Stage 2 balances styles and draws unique songs before selecting one segment. The Stage-1 budget is
+capped at 60 data passes, 50k optimizer steps, and a 5k-step floor. Stage 2 uses 12k steps and a
+four-step differentiable training solver; final generation uses the configured 32-step solver.
 
 Latent caching has its own inference batch size, and all inference paths use inference mode plus
-bf16 where numerically safe. Length bucketing avoids padding every codec or evaluator batch to its
-maximum token length, while persistent loader workers overlap MIDI parsing with GPU work. The token
-evaluator uses one factual segment per song, as its pre-existing de-duplication intended, instead
-of silently training on roughly twenty overlapping XMIDI windows per song.
+bf16 where numerically safe. Length bucketing avoids padding every codec batch to its maximum token
+length, while persistent loader workers overlap MIDI parsing with GPU work.
 
 Validate a node with the full-size memory suite before a long run:
 
@@ -405,27 +415,29 @@ without it (16.0 GiB); these preserve the previous effective batches while elimi
 two serial micro-batches per optimizer step. The pitched codec is capped at eight data epochs and
 100k optimizer steps.
 
-## Evaluators, generation, and evaluation
+## CLaMP 2, generation, and evaluation
 
-Evaluators train only on real train-split MIDI:
+The main style metric no longer trains an in-domain Transformer classifier. It uses the official
+[CLaMP 2](https://github.com/sanderwood/clamp2) music/text embedding model and fixed prompts such
+as `This is a piece of rock music.`. This checkout is installed under `external/clamp2`; its two
+large released checkpoints live under `/l/users/gus.xia/ziyuan/music-scm/checkpoints/clamp2` and
+are symlinked into `code/`, as required by the upstream extractor. CLaMP 2's runtime dependencies
+are part of the project environment, so no separate Conda environment is needed:
 
 ```bash
-# One A100: token Transformer evaluator
-CUDA_VISIBLE_DEVICES=0 uv run python -m cfmusic.commands.train_evaluator \
-  data=xmidi evaluator=transformer task=genre paths.data_root=$CFMUSIC_DATA_ROOT
-
-# Four A100s: token Transformer evaluator
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
-  -m cfmusic.commands.train_evaluator data=xmidi evaluator=transformer task=genre \
-  paths.data_root=$CFMUSIC_DATA_ROOT
-
-# CPU-only scikit-learn descriptor baseline (not a GPU-distributed stage)
-uv run python -m cfmusic.commands.train_evaluator data=xmidi evaluator=descriptor_mlp task=genre
+git clone https://github.com/sanderwood/clamp2 external/clamp2
+export CLAMP2_REPOSITORY=$CFMUSIC_PROJECT_ROOT/external/clamp2
+export CLAMP2_CACHE_DIR=/l/users/gus.xia/ziyuan/music-scm/checkpoints/clamp2/huggingface
 ```
 
-The Transformer evaluator uses the same `last.pt`/`resume=true` contract. The descriptor MLP
-atomically overwrites `last.joblib` every `evaluator.checkpoint_interval` iterations and also
-supports `resume=true`; its final export remains `descriptor_mlp.joblib`.
+Evaluation converts each generated MIDI to CLaMP 2's lossless MTF input, extracts normalized MIDI
+and style-text embeddings once, and reports target similarity, source similarity, their margin,
+and zero-shot target success. The prompt is configurable through
+`evaluation.clamp2.style_template`.
+
+The evaluation launched by `cfm.sh` fixes `task=genre`, so CLaMP 2 compares only the XMIDI style
+(genre) labels and does not treat emotion or another auxiliary label as an intervention. The
+noise-leakage probes, content-preservation metrics, and MIDI-quality diagnostics are still run.
 
 Generate and evaluate unpaired counterfactuals:
 
@@ -441,7 +453,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
   codec_checkpoint=/l/users/gus.xia/ziyuan/music-scm/checkpoints/e00_xmidi_codec/codec/xmidi/last.pt \
   counterfactual.target_policy=all_other
 
-uv run python -m cfmusic.commands.evaluate experiment=e22_cfm_exoreg
+uv run python -m cfmusic.commands.evaluate experiment=e22_cfm_exoreg \
+  evaluation.clamp2.repository=$CLAMP2_REPOSITORY
 uv run python -m cfmusic.commands.build_report \
   report.experiments='[e10_ddim_vanilla,e11_ddim_fpi,e20_cfm_base,e22_cfm_exoreg]'
 ```
@@ -456,7 +469,10 @@ can finish sooner at EOS. Completed artifacts are skipped on reruns. Override
 `counterfactual.max_sources_per_style`, `counterfactual.max_total_sources`, or
 `counterfactual.targets_per_source` only when a larger evaluation set is needed.
 
-Evaluation reports factual round trips, generated-noise recovery, leakage probes, style probability, non-intervened retention, separate symbolic preservation metrics, counterfactual algebra, distribution distances, and cross-seed spread. It never requires a paired target MIDI.
+Evaluation reports CLaMP 2 zero-shot style alignment, pitch-class histogram cosine, a
+transposition-invariant melody-contour cosine, descriptor/tempo/density preservation, independent
+linear/MLP/temporal noise probes, and reference-free MIDI validity/range/density/duration metrics.
+It never requires a paired target MIDI.
 
 ## Experiment matrix
 
@@ -471,7 +487,10 @@ uv run mypy src
 uv run pytest -q
 ```
 
-Seeds, RNG states, style vocabulary/provenance hashes, normalization, optimizer/scheduler/scaler state, EMA, and fixed random projection are checkpointed. Matched DDIM/CFM evaluation uses 16/32/64-step grids and counts every model evaluation, including FPI calls. See [docs/reproducibility.md](docs/reproducibility.md).
+Seeds, RNG states, style vocabulary/provenance hashes, normalization schema,
+optimizer/scheduler/scaler state, EMA, condition schema, and deterministic dynamic-projector seed
+rules are recorded. Matched DDIM/CFM evaluation counts every model evaluation, including FPI
+calls. See [docs/reproducibility.md](docs/reproducibility.md).
 
 ## Known limitations
 

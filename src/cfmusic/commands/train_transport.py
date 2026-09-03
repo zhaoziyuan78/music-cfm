@@ -10,6 +10,10 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset
 
+from cfmusic.conditioning.schema import (
+    condition_schema_provenance,
+    validate_condition_checkpoint,
+)
 from cfmusic.config import CONFIG_DIR, config_mapping, prepare_config
 from cfmusic.data.samplers import ShardBatchSampler
 from cfmusic.distributed import (
@@ -67,20 +71,39 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     cache_metadata = [latent_dataset.metadata for latent_dataset in latent_datasets]
     training = cfg.transport.training
     factorial = bool(cfg.experiment.get("factorial", False))
+    task = str(cfg.data.get("task", cfg.task))
+    active_axis = str(cfg.counterfactual.get("factorial_intervention", "genre"))
+    if active_axis == "joint":
+        active_axis = "genre"
     label_values: dict[str, list[int]] = {}
-    for column in ("genre_id", "emotion_id") if factorial else ("style_id",):
-        label_values[column] = sorted(
+    label_columns = ("genre_id", "emotion_id") if factorial else ("style_id",)
+    for output_column in label_columns:
+        source_column = (
+            output_column
+            if factorial
+            else (
+                f"{task}_id"
+                if all(f"{task}_id" in latent.frame for latent in latent_datasets)
+                else "style_id"
+            )
+        )
+        label_values[output_column] = sorted(
             {
                 int(value)
                 for latent_dataset in latent_datasets
-                if column in latent_dataset.frame
-                for value in latent_dataset.frame[column].dropna().astype(int).tolist()
+                if source_column in latent_dataset.frame
+                for value in latent_dataset.frame[source_column].dropna().astype(int).tolist()
             }
         )
+    balance_column = (
+        f"{task}_id"
+        if not factorial and all(f"{task}_id" in latent.frame for latent in latent_datasets)
+        else "style_id"
+    )
     all_style_labels = [
         int(value)
         for latent_dataset in latent_datasets
-        for value in latent_dataset.frame["style_id"].astype(int).tolist()
+        for value in latent_dataset.frame[balance_column].astype(int).tolist()
     ]
     class_balance_exponent = float(training.get("class_balance_exponent", 0.0))
     style_loss_weights = (
@@ -95,7 +118,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         else 0.0
     )
     validation_batch: dict[str, torch.Tensor] | None = None
-    if context.is_main and condition_contrast_weight > 0 and isinstance(dataset, LatentDataset):
+    if context.is_main and isinstance(dataset, LatentDataset):
         validation_dataset = LatentDataset(
             latent_root,
             split="validation",
@@ -110,12 +133,17 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         validation_batch = heldout_condition_batch(
             validation_dataset,
             samples_per_style=int(training.get("validation_samples_per_style", 16)),
+            task=task,
+            factorial=factorial,
+            active_axis=active_axis,
         )
     if bool(cfg.experiment.get("shuffled_labels", False)) and isinstance(dataset, LatentDataset):
         generator = torch.Generator().manual_seed(int(cfg.seed))
-        original = torch.as_tensor(dataset.frame["style_id"].astype(int).to_numpy())
+        original = torch.as_tensor(dataset.frame[balance_column].astype(int).to_numpy())
         shuffled = original[torch.randperm(len(original), generator=generator)]
-        dataset.frame["style_id"] = shuffled.numpy()
+        dataset.frame[balance_column] = shuffled.numpy()
+        if balance_column != "style_id":
+            dataset.frame["style_id"] = shuffled.numpy()
         dataset.refresh_index()
         import json
 
@@ -132,6 +160,11 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     batch_sampler = ShardBatchSampler(
         shard_ids,
         batch_size=int(training.batch_size),
+        sample_ids=(
+            dataset.frame["sample_id"].astype(str).tolist()
+            if isinstance(dataset, LatentDataset)
+            else None
+        ),
         rank=context.rank,
         world_size=context.world_size,
         seed=int(cfg.seed),
@@ -178,6 +211,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         if not isinstance(resumed, dict):
             raise TypeError("Transport checkpoint must contain a mapping")
         validate_transport_cache_provenance(resumed, cache_metadata)
+        validate_condition_checkpoint(resumed, task=task, factorial=factorial)
         del resumed
     if context.is_main:
         global_batch = (
@@ -221,8 +255,13 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         checkpoint_dir=checkpoint_dir,
         checkpoint_interval=int(training.checkpoint_interval),
         config=config_mapping(cfg.transport),
-        provenance={"latent_cache_metadata_json": serialize_cache_metadata(cache_metadata)},
+        provenance={
+            "latent_cache_metadata_json": serialize_cache_metadata(cache_metadata),
+            **condition_schema_provenance(task=task, factorial=factorial),
+        },
         factorial_conditioning=factorial,
+        condition_task=task,
+        factorial_active_axis=active_axis,
         condition_contrast_weight=condition_contrast_weight,
         condition_contrast_margin=float(condition_objective.get("margin", 0.0)),
         condition_contrast_samples=int(condition_objective.get("samples_per_batch", 0)) or None,
@@ -230,6 +269,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         style_loss_weights=style_loss_weights,
         validation_batch=validation_batch,
         validation_seed=int(cfg.seed) + 2026,
+        validation_solver_steps=int(training.get("validation_solver_steps", 8)),
         ema_decay=float(training.get("ema_decay", 0.9999)),
         ema_update_interval=int(training.get("ema_update_interval", 10)),
         log_interval=int(training.get("log_interval", 10)),
