@@ -249,9 +249,21 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
     device = context.device
     reset_peak_memory(device)
     data_name = str(cfg.data.name)
-    latent_dataset = LatentDataset(paths["latent_dir"] / data_name, split="test")
+    latent_index_value = cfg.data.get("latent_index")
+    latent_index = (
+        Path(str(latent_index_value)).expanduser().resolve()
+        if latent_index_value is not None
+        else None
+    )
+    latent_dataset = LatentDataset(
+        paths["latent_dir"] / data_name, split="test", index_path=latent_index
+    )
     if len(latent_dataset) == 0:
-        latent_dataset = LatentDataset(paths["latent_dir"] / data_name, split="validation")
+        latent_dataset = LatentDataset(
+            paths["latent_dir"] / data_name,
+            split="validation",
+            index_path=latent_index,
+        )
     validate_latent_dataset(
         latent_dataset,
         codec_cfg=cfg.codec,

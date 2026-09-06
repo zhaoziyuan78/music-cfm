@@ -57,11 +57,18 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
             "transport_checkpoint must point to Stage 1 when no Stage-2 checkpoint is resumed"
         )
     latent_root = paths["latent_dir"] / str(cfg.data.name)
+    latent_index_value = cfg.data.get("latent_index")
+    latent_index = (
+        Path(str(latent_index_value)).expanduser().resolve()
+        if latent_index_value is not None
+        else None
+    )
     sampler_cfg = cfg.independence.sampler
     training = cfg.independence.training
     dataset = LatentDataset(
         latent_root,
         split="train",
+        index_path=latent_index,
         shard_cache_size=max(1, int(sampler_cfg.classes_per_batch)),
     )
     validate_latent_dataset(
@@ -95,6 +102,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         validation_dataset = LatentDataset(
             latent_root,
             split="validation",
+            index_path=latent_index,
             shard_cache_size=max(1, len(label_values.get("style_id", []))),
         )
         validate_latent_dataset(

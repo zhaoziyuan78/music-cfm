@@ -49,8 +49,16 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     seed_everything(int(cfg.seed))
     data_name = str(cfg.data.name)
     latent_root = paths["latent_dir"] / data_name
+    latent_index_value = cfg.data.get("latent_index")
+    latent_index = (
+        Path(str(latent_index_value)).expanduser().resolve()
+        if latent_index_value is not None
+        else None
+    )
     dataset: Dataset[dict[str, torch.Tensor | str | int]]
     if "datasets" in cfg.data:
+        if latent_index is not None:
+            raise ValueError("data.latent_index is only supported for a single latent dataset")
         dataset_names = [str(name) for name in cfg.data.datasets]
         combined = CombinedLatentDataset(
             [paths["latent_dir"] / name for name in dataset_names], split="train"
@@ -58,7 +66,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         dataset = combined
         latent_datasets = combined.datasets
     else:
-        dataset = LatentDataset(latent_root, split="train")
+        dataset = LatentDataset(latent_root, split="train", index_path=latent_index)
         dataset_names = [data_name]
         latent_datasets = [dataset]
     for name, latent_dataset in zip(dataset_names, latent_datasets, strict=True):
@@ -122,6 +130,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         validation_dataset = LatentDataset(
             latent_root,
             split="validation",
+            index_path=latent_index,
             shard_cache_size=max(1, len(label_values.get("style_id", []))),
         )
         validate_latent_dataset(
