@@ -124,7 +124,7 @@
       background: var(--panel);
     }
     .flow {
-      display: grid; grid-template-columns: repeat(7,minmax(112px,1fr)); gap: 22px;
+      display: grid; grid-template-columns: repeat(8,minmax(112px,1fr)); gap: 22px;
       overflow-x: auto; padding: 14px 4px 27px;
     }
     .node {
@@ -230,8 +230,8 @@
         <a href="#beat">04 · BEAT</a>
         <a href="#vae">05 · Transformer VAE</a>
         <a href="#latent">06 · Latent 与条件</a>
-        <a href="#stage1">07 · Stage 1</a>
-        <a href="#stage2">08 · Stage 2</a>
+        <a href="#stage1">07 · Unified CFM</a>
+        <a href="#stage2">08 · CFG &amp; round trip</a>
         <a href="#alternatives">09 · 对照方法</a>
         <a href="#generation">10 · 反事实生成</a>
         <a href="#evaluation">11 · Evaluation</a>
@@ -268,7 +268,7 @@
             <p class="tiny muted" style="margin-top:12px">共享变量是 abducted noise <code>u</code>；干预只发生在 condition。</p>
           </article>
         </div>
-        <div class="callout" style="margin-top:18px">Stage 1 学习条件生成分布；Stage 2 约束反演噪声的风格独立性、先验匹配和 source-condition round trip。Evaluation 将风格变化、非风格内容保留、噪声泄漏和 MIDI 合法性分别报告。</div>
+        <div class="callout" style="margin-top:18px">单个 CFM trainer 学习条件生成分布，并在 warm-up 后加入 source-condition round trip；classifier-free guidance 同时用于反演和正向预测。HSIC、noise prior、cross-class MMD/SWD 不参与训练，仅保留为 evaluation diagnostics。</div>
       </section>
 
       <section id="pipeline">
@@ -279,9 +279,10 @@
           <div class="node"><span class="step">02</span><b>Tokenize</b><small>BEAT 593 tokens<br>小节级表示</small></div>
           <div class="node"><span class="step">03</span><b>Codec</b><small>Transformer VAE<br>MIDI ↔ latent</small></div>
           <div class="node"><span class="step">04</span><b>Cache</b><small>posterior mean<br>per-token norm</small></div>
-          <div class="node"><span class="step">05</span><b>Transport</b><small>I-CFM / DDIM<br>条件分布学习</small></div>
-          <div class="node"><span class="step">06</span><b>Intervene</b><small>abduct source<br>predict target</small></div>
-          <div class="node"><span class="step">07</span><b>Evaluate</b><small>style · content<br>noise · quality</small></div>
+          <div class="node"><span class="step">05</span><b>Relabel</b><small>CLaMP 2 prompts<br>genre overlay</small></div>
+          <div class="node"><span class="step">06</span><b>Unified CFM</b><small>CFM · CFG dropout<br>delayed round trip</small></div>
+          <div class="node"><span class="step">07</span><b>Intervene</b><small>CFG abduct source<br>CFG predict target</small></div>
+          <div class="node"><span class="step">08</span><b>Evaluate</b><small>style · content<br>noise · quality</small></div>
         </div>
         <div class="grid-3">
           <article class="card"><h3>表示层</h3><p class="muted">MIDI → BEAT tokens → VAE latent。该层决定重建上限和后续连续空间的几何结构。</p></article>
@@ -406,6 +407,7 @@
             <p class="muted">encoder inference 输出 raw posterior mean，pitched shape 为 `64 × 512`。每 shard 最多 8,192 samples；index 保留 sample、split、style、genre、emotion 与 shard offset。</p>
             <div class="specs"><span>RAW MEAN</span><span>FP16</span><span>8192/SHARD</span></div>
             <p class="tiny muted" style="margin-top:12px">metadata 保存 codec checkpoint/config、tokenizer、manifest、normalization、latent shape 与 overlength policy 的 hash。</p>
+            <p class="tiny muted">CLaMP 2 prompt 重标只写新的 manifest/index label overlay，不重新编码或复制 latent shard。</p>
           </article>
           <article class="card">
             <h3>per-token-v2 normalization</h3>
@@ -420,7 +422,7 @@
             <div class="method-row"><div class="icon">E</div><div><b>Emotion / style</b><div class="tiny muted">当前任务标签只进入 style slot</div></div></div>
             <div class="method-row"><div class="icon">F</div><div><b>Factorial task</b><div class="tiny muted">style=0 sentinel + genre + emotion</div></div></div>
           </div>
-          <p class="muted tiny" style="margin-top:12px">训练、held-out validation、abduction、target intervention 和 generation 共享同一个 `build_condition_batch()`；factorial 模式一次只修改一个激活轴。</p>
+          <p class="muted tiny" style="margin-top:12px">训练、held-out validation、abduction、target intervention 和 generation 共享同一个 `build_condition_batch()`；factorial 模式一次只修改一个激活轴。CFG null branch 保留 dataset/task context，仅屏蔽 style/genre/emotion semantic embedding。</p>
         </div>
         <div class="card" style="margin-top:18px">
           <h3>四卡 cache 调度</h3>
@@ -429,8 +431,8 @@
       </section>
 
       <section id="stage1">
-        <div class="section-kicker">Stage 1 · conditional flow matching</div>
-        <h2>共享 AdaLN DiT 学习风格条件向量场</h2>
+        <div class="section-kicker">Unified conditional flow matching</div>
+        <h2>一个 trainer 学习条件向量场与可逆一致性</h2>
         <div class="grid-2">
           <article class="card">
             <h3>Latent DiT backbone</h3>
@@ -447,44 +449,44 @@
           <article class="card">
             <h3>Independent CFM objective</h3>
             <div class="equation">ε ~ N(0, I), &nbsp;t ~ Uniform(0,1)<br>zₜ = (1−t)ε + tz<br>v* = ∂zₜ/∂t = z − ε<br><br>L_CFM = E ||vθ(zₜ,t,c) − v*||²</div>
-            <p class="muted tiny" style="margin-top:12px">loss 按 style frequency 的 inverse square-root 加权。主目标只使用有效 factual condition/path。</p>
+            <p class="muted tiny" style="margin-top:12px">重标 XMIDI 主运行按 style frequency 的 inverse-frequency 加权。主目标只使用有效 factual condition/path。</p>
           </article>
         </div>
         <div class="card" style="margin-top:18px">
-          <h3>Stage 1 训练策略</h3>
+          <h3>统一 CFM 训练策略</h3>
           <div class="specs"><span>512 / GPU</span><span>GLOBAL 2048 @ 4 GPU</span><span>LR 1E−4</span><span>WARMUP 1500</span><span>MAX 50K</span><span>BF16</span><span>MATH SDPA</span><span>EMA .9999 / 10</span></div>
           <p class="muted" style="margin-top:13px">ShardBatchSampler 保持磁盘 locality，同时先按 song 等权、再从同一 song 的多个 segment 中轮换选择窗口。held-out validation 从每个 style 取固定样本，用相同噪声生成条件 endpoint，分别计算 raw/EMA 的 class-conditional MMD 与 sliced Wasserstein distance。</p>
         </div>
         <div class="fork" style="margin-top:18px">
-          <div class="card"><span class="step">ABDUCTION</span><h3>t = 1 → 0</h3><p class="muted">在 source condition 下对 ODE 反向积分：`z_source → u`。</p></div>
+          <div class="card"><span class="step">ABDUCTION</span><h3>t = 1 → 0</h3><p class="muted">在 source CFG vector field 下对 ODE 反向积分：`z_source → u`。</p></div>
           <div class="fork-line"></div>
-          <div class="card"><span class="step">PREDICTION</span><h3>t = 0 → 1</h3><p class="muted">在 source condition 下重建 factual latent，或在 target condition 下生成 counterfactual latent。</p></div>
+          <div class="card"><span class="step">PREDICTION</span><h3>t = 0 → 1</h3><p class="muted">用 source CFG 重建 factual latent，或用 target CFG 生成 counterfactual latent。</p></div>
         </div>
         <p class="intro" style="margin-top:18px">默认 solver 是 32-step fixed-grid Heun。系统记录实际 NFE；Heun 的 predictor/corrector 通常使 NFE 高于名义 solver steps。</p>
       </section>
 
       <section id="stage2">
-        <div class="section-kicker">Stage 2 · exogeneity fine-tuning</div>
-        <h2>约束共享噪声，而不放弃基础生成目标</h2>
-        <p class="intro">Stage 2 从 Stage 1 EMA 权重初始化。每个 step 都保留基础 CFM/DDIM loss；每两个 step 额外执行可微 4-step abduction 和同条件 reconstruction，在全局 DDP batch 上施加外生性和 round-trip 正则。</p>
-        <div class="equation">L = L_base + r(t) [<br>&nbsp;&nbsp;λ_h · HSIC(u, s)<br>&nbsp;+ λ_p · SWD(u, N(0,I))<br>&nbsp;+ λ_c · MMD_cross-class(u)<br>&nbsp;+ λ_r · (L1 round-trip + 0.1 · cosine round-trip)<br>]<br><br>λ_h = .01, λ_p = .005, λ_c = .01, λ_r = .25</div>
+        <div class="section-kicker">CFG &amp; scheduled round-trip</div>
+        <h2>条件控制和回环约束并入同一次训练</h2>
+        <p class="intro">E24 不建立第二个模型、optimizer 或 checkpoint 阶段。每个 optimizer step 都使用 CFM loss；round-trip 在 CFM 已形成基本向量场后才逐步加入。训练不使用 HSIC、Gaussian-prior SWD、cross-class MMD 或 adversarial noise loss。</p>
+        <div class="equation">L = L_CFM + λ_RT(k) · [<br>&nbsp;&nbsp;L1(F_c(F_c⁻¹(z)), z)<br>&nbsp;+ 0.1 · cosine_distance(F_c(F_c⁻¹(z)), z)<br>]<br><br>λ_RT(k): 0 for first 5k steps → linear ramp to .25 over next 5k</div>
         <div class="grid-3" style="margin-top:18px">
           <article class="card">
-            <h3>动态多视图 noise</h3>
-            <p class="muted">每 step 重采样 3 个 `32768→128` Rademacher projections，并加入 per-token mean/std summary 与随机 `8 tokens × 32 channels` raw block。</p>
+            <h3>有界 round trip</h3>
+            <p class="muted">每 4 个 optimizer step 执行一次；每 GPU 随机取 16 条 latent，abduction 与 source reconstruction 各使用 2-step Heun。</p>
           </article>
           <article class="card">
-            <h3>全局 DDP 正则</h3>
-            <p class="muted">features 通过 differentiable all-gather 合并，labels 同步 gather；HSIC、SWD 和 cross-class MMD 在四卡完整 batch 上计算。</p>
+            <h3>CFG training</h3>
+            <p class="muted">以 10% 概率逐样本移除 semantic condition；null branch 保留 dataset/task，屏蔽 style/genre/emotion。</p>
           </article>
           <article class="card">
-            <h3>层级 balanced sampler</h3>
-            <p class="muted">每 GPU `4 styles × 16 samples`，采样顺序为 style → unique song/sample_id → one segment。</p>
+            <h3>CFG inference</h3>
+            <p class="muted">`v_cfg = v_null + 1.5(v_cond−v_null)`；null/conditional 沿 batch 合并，并同时用于 abduction 和 prediction。</p>
           </article>
         </div>
         <div class="card" style="margin-top:18px">
-          <div class="specs"><span>12K STEPS</span><span>LR 2E−5</span><span>WARMUP 500</span><span>RAMP 2000</span><span>EMA .999 / 10</span><span>INVERSE 4</span></div>
-          <p class="muted" style="margin-top:12px">checkpoint interval 为 1,000 step。每次 checkpoint 同时验证 raw 与 EMA：conditional endpoint MMD/SWD、held-out noise HSIC/SWD/cross-class MMD 和 source-condition round trip。</p>
+          <div class="specs"><span>CFM EVERY STEP</span><span>RT EVERY 4</span><span>RT 16 / GPU</span><span>HEUN 2 + 2</span><span>CFG DROP .10</span><span>CFG SCALE 1.5</span></div>
+          <p class="muted" style="margin-top:12px">统一 checkpoint interval 为 2,500 step，始终原子覆盖 `transport/last.pt`。resume 要求相同的 CFG training settings；生成时允许扫描 guidance scale。</p>
         </div>
       </section>
 
@@ -537,8 +539,8 @@
             <h3>批量执行</h3>
             <ol class="muted">
               <li>读取并归一化 source latent。</li>
-              <li>source condition 下仅 abduct 一次。</li>
-              <li>同一 noise 与多个 target conditions 组成 batch。</li>
+              <li>source condition 下用 CFG 仅 abduct 一次。</li>
+              <li>同一 noise 与多个 target conditions 组成 CFG batch。</li>
               <li>反归一化后用 VAE K/V-cache decoder 生成 MIDI。</li>
             </ol>
             <div class="specs"><span>TARGET BATCH 8</span><span>DECODE BATCH 8</span><span>4-RANK SOURCE SHARDING</span></div>
@@ -547,13 +549,13 @@
         <div class="flow" style="grid-template-columns:repeat(5,minmax(145px,1fr)); margin-top:10px">
           <div class="node"><b>Source MIDI</b><small>固定 test song</small></div>
           <div class="node"><b>Encode</b><small>posterior mean z</small></div>
-          <div class="node"><b>Abduct</b><small>F⁻¹_source(z)=u</small></div>
-          <div class="node"><b>Intervene</b><small>F_target(u)=z_cf</small></div>
+          <div class="node"><b>CFG Abduct</b><small>F⁻¹_source(z)=u</small></div>
+          <div class="node"><b>CFG Intervene</b><small>F_target(u)=z_cf</small></div>
           <div class="node"><b>Decode</b><small>counterfactual MIDI</small></div>
         </div>
         <div class="card">
           <h3>Artifact contract</h3>
-          <p class="muted">每个 transition 保存 `source.mid`、`counterfactual.mid`、`abducted_noise.pt` 与 metadata。metadata 包含 sample/source/target、condition schema、factorial axis、checkpoint provenance、solver steps 和 inverse/forward NFE；完整 artifact 可在重跑时跳过。</p>
+          <p class="muted">每个 transition 保存 `source.mid`、`counterfactual.mid`、`abducted_noise.pt` 与 metadata。metadata 包含 sample/source/target、condition schema、CFG scale、factorial axis、checkpoint provenance、solver steps 和实际 inverse/forward NFE；生成 config hash 防止错误复用不同 guidance 的旧 artifact。</p>
         </div>
       </section>
 
@@ -586,7 +588,7 @@
           </article>
           <article class="card">
             <h3>③ Abducted-noise leakage</h3>
-            <p class="muted">每个 unique source song 只保留一份 noise。评估器重新训练、并与 Stage 2 adversary 独立：</p>
+            <p class="muted">每个 unique source song 只保留一份 noise。probe 与 transport 训练完全独立，且所有 noise 指标只用于诊断：</p>
             <ul class="muted">
               <li>standardized logistic regression</li>
               <li>两层 MLP `(128,64)`</li>
@@ -609,7 +611,7 @@
           <h3>Codec 与 transport 内部验证</h3>
           <div class="grid-2">
             <div><b>Codec</b><p class="muted tiny">token CE/accuracy、free-running token accuracy、note-event multiset F1、exact sequence、EOS/grammar validity、zero/shuffled-latent degradation。</p></div>
-            <div><b>Transport</b><p class="muted tiny">conditional endpoint MMD/SWD、factual round trip、noise recovery、HSIC/SWD/MMD、16/32/64-step NFE 与 runtime、跨 seed ambiguity。</p></div>
+            <div><b>Transport</b><p class="muted tiny">训练期 conditional endpoint MMD/SWD；正式评估另测 factual round trip、noise recovery/probes、16/32/64-step NFE 与 runtime、跨 seed ambiguity。</p></div>
           </div>
         </div>
         <div class="callout" style="margin-top:18px">Evaluation 不训练 in-domain Transformer style classifier 作为主指标；风格判断使用 CLaMP 2 的 MIDI-text embedding，noise probe、content preservation 和 MIDI quality 保持为独立评估维度。</div>
@@ -638,8 +640,7 @@
             <tbody>
               <tr><td>XMIDI VAE</td><td>32</td><td>BF16 · automatic SDPA · activation checkpointing</td><td>1,000</td><td>1 GPU or torchrun 4 GPU</td></tr>
               <tr><td>Latent cache</td><td>384</td><td>BF16 inference · weighted rank partition</td><td>atomic cache publish</td><td>1 GPU or torchrun 4 GPU</td></tr>
-              <tr><td>CFM Stage 1</td><td>512</td><td>BF16 · math SDPA</td><td>2,500</td><td>1 GPU or torchrun 4 GPU</td></tr>
-              <tr><td>CFM Stage 2</td><td>64</td><td>BF16 · math SDPA · inverse every 2 steps</td><td>1,000</td><td>1 GPU or torchrun 4 GPU</td></tr>
+              <tr><td>Unified CFM</td><td>512 + RT subset 16</td><td>BF16 · math SDPA · RT every 4 steps</td><td>2,500</td><td>1 GPU or torchrun 4 GPU</td></tr>
             </tbody>
           </table>
         </div>
@@ -648,12 +649,11 @@
           <pre><button class="copy" type="button">复制</button><code>sbatch cfm.sh
 
 # cfm.sh 顺序执行：
-# 1. cache XMIDI latents
-# 2. train E20 CFM Stage 1
-# 3. fine-tune E22 Stage 2
-# 4. generate counterfactuals
-# 5. evaluate style with CLaMP 2 + content/noise/quality
-# 6. build aggregate report</code></pre>
+# 1. relabel XMIDI with nearest CLaMP 2 genre prompt
+# 2. train E24 unified CFM + delayed round trip + CFG
+# 3. generate with CFG in abduction and prediction
+# 4. evaluate genre/style + content/noise/quality
+# 5. build aggregate report</code></pre>
         </div>
       </section>
 
@@ -669,8 +669,8 @@
           <div><code>conditioning/schema.py</code><br><span class="tiny muted">唯一 condition builder</span></div>
           <div><code>models/latent_vector_field.py</code><br><span class="tiny muted">AdaLN DiT vector field</span></div>
           <div><code>transport/conditional_flow.py</code><br><span class="tiny muted">CFM 与 ODE counterfactual API</span></div>
-          <div><code>training/transport_trainer.py</code><br><span class="tiny muted">Stage 1 训练与 endpoint validation</span></div>
-          <div><code>training/abduction_trainer.py</code><br><span class="tiny muted">Stage 2 外生性训练</span></div>
+          <div><code>training/transport_trainer.py</code><br><span class="tiny muted">统一 CFM、scheduled round trip 与 endpoint validation</span></div>
+          <div><code>configs/experiment/e24_cfm_cfg_roundtrip.yaml</code><br><span class="tiny muted">当前统一训练、CFG 与 round-trip schedule</span></div>
           <div><code>commands/generate_counterfactuals.py</code><br><span class="tiny muted">反演、干预、批量解码</span></div>
           <div><code>commands/evaluate.py</code><br><span class="tiny muted">CLaMP 2、content、probe、quality</span></div>
         </div>

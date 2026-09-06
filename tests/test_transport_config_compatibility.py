@@ -18,6 +18,7 @@ CONFIGS = Path(__file__).parents[1] / "configs"
         "e21_cfm_hsic",
         "e22_cfm_exoreg",
         "e23_otcfm_exoreg",
+        "e24_cfm_cfg_roundtrip",
         "e30_xmidi_factorial",
         "e40_split_cfm",
         "e50_independent_flows",
@@ -44,9 +45,7 @@ def test_groove_transport_retains_its_32_x_256_codec_shape() -> None:
     assert expected_transport_input_dim(config.transport) == 256
 
 
-@pytest.mark.parametrize(
-    "experiment", ["e31_emopia_cfm", "e32_vgmidi_cfm", "e60_cross_domain_4q"]
-)
+@pytest.mark.parametrize("experiment", ["e31_emopia_cfm", "e32_vgmidi_cfm", "e60_cross_domain_4q"])
 def test_other_pitched_transports_also_use_the_512_dimensional_codec(
     experiment: str,
 ) -> None:

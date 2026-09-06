@@ -26,19 +26,26 @@ class AdditiveConditionEmbedding(nn.Module):
         self.emotion = nn.Embedding(num_emotions, embedding_dim)
 
     def forward(self, condition: ConditionBatch) -> Tensor:
-        embedding = (
-            self.dataset(condition.dataset_id)
-            + self.task(condition.task_id)
-            + self.style(condition.style_id)
-        )
+        context = self.dataset(condition.dataset_id) + self.task(condition.task_id)
+        semantic = self.style(condition.style_id)
+        embedding = context + semantic
         if condition.genre_id is not None:
-            embedding = embedding + self.genre(condition.genre_id)
+            genre = self.genre(condition.genre_id)
         else:
             # Keep every embedding parameter in the static DDP graph without changing
             # the unconditional value. This removes find_unused_parameters traversal.
-            embedding = embedding + self.genre.weight[0].sum() * 0.0
+            genre = self.genre.weight[0].sum() * 0.0
+        embedding = embedding + genre
+        semantic = semantic + genre
         if condition.emotion_id is not None:
-            embedding = embedding + self.emotion(condition.emotion_id)
+            emotion = self.emotion(condition.emotion_id)
         else:
-            embedding = embedding + self.emotion.weight[0].sum() * 0.0
-        return embedding
+            emotion = self.emotion.weight[0].sum() * 0.0
+        embedding = embedding + emotion
+        if condition.condition_mask is None:
+            return embedding
+        semantic = semantic + emotion
+        mask = condition.condition_mask.to(semantic).reshape(-1, 1)
+        if mask.shape[0] != semantic.shape[0]:
+            raise ValueError("Condition mask batch does not match embedded conditions")
+        return context + semantic * mask

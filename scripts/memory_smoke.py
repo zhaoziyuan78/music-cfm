@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from cfmusic.codec.losses import vae_loss
 from cfmusic.codec.transformer_vae import TransformerVAE
@@ -32,8 +32,10 @@ from cfmusic.models.latent_vector_field import ConditionalVectorField
 from cfmusic.tokenization.beat import BeatTokenizer, BeatTokenizerConfig
 from cfmusic.tokenization.factory import tokenizer_from_config
 from cfmusic.training.state import ExponentialMovingAverage
+from cfmusic.training.transport_trainer import TransportLossModule
 from cfmusic.transport.conditional_ddim import ConditionalDDIM
 from cfmusic.transport.conditional_flow import ConditionalFlow
+from cfmusic.transport.factory import create_transport
 
 Case = Callable[[torch.device], dict[str, float | int | str]]
 CODEC_BATCH = 32
@@ -49,6 +51,8 @@ LATENT_DIM = 512
 def _codec(device: torch.device, *, training: bool) -> TransformerVAE:
     codec_config = OmegaConf.load(Path(CONFIG_DIR) / "codec" / f"{CODEC_PROFILE}.yaml")
     tokenizer_config = OmegaConf.load(Path(CONFIG_DIR) / "tokenizer" / "beat.yaml")
+    if not isinstance(codec_config, DictConfig) or not isinstance(tokenizer_config, DictConfig):
+        raise TypeError("Codec and tokenizer profiles must be mapping configs")
     tokenizer = tokenizer_from_config(tokenizer_config, max_sequence_length=CODEC_TOKENS)
     codec_config.max_sequence_length = CODEC_TOKENS
     codec_config.training.gradient_checkpointing = CODEC_GRADIENT_CHECKPOINTING
@@ -205,6 +209,70 @@ def transport_train(device: torch.device) -> dict[str, float | int | str]:
     }
 
 
+def unified_cfm_train(device: torch.device) -> dict[str, float | int | str]:
+    """Exercise the production CFM + scheduled round-trip + CFG peak."""
+
+    config = OmegaConf.load(Path(CONFIG_DIR) / "transport" / "cfm.yaml")
+    if not isinstance(config, DictConfig):
+        raise TypeError("CFM profile must be a mapping config")
+    config.classifier_free_guidance = True
+    config.condition_dropout = 0.1
+    config.guidance_scale = 1.5
+    model = create_transport(config).to(device)
+    if not isinstance(model, ConditionalFlow):
+        raise TypeError("The unified CFM memory case requires ConditionalFlow")
+    objective = TransportLossModule(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    ema = ExponentialMovingAverage(model)
+    latent = torch.randn(512, LATENT_TOKENS, LATENT_DIM, device=device)
+    condition = _condition(512, device)
+    step_times: list[float] = []
+    losses: dict[str, torch.Tensor] = {}
+    # Step 1 materializes AdamW state. Step 2 measures the steady CFM path.
+    # Step 3 runs round-trip after the zero-initialized output has learned a
+    # non-zero field, checking the complete differentiable CFG path.
+    for roundtrip_weight in (0.0, 0.0, 0.25):
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        with sdpa_kernel_context(device, "math"):
+            with autocast_context(device, "bf16"):
+                losses = objective(
+                    latent,
+                    condition,
+                    None,
+                    None,
+                    condition_contrast_weight=0.0,
+                    condition_contrast_margin=0.0,
+                    condition_contrast_samples=None,
+                    roundtrip_weight=roundtrip_weight,
+                    roundtrip_steps=2,
+                    roundtrip_samples=16,
+                    roundtrip_cosine_weight=0.1,
+                )
+            losses["loss"].backward()
+        optimizer.step()
+        ema.update(model)
+        torch.cuda.synchronize(device)
+        step_times.append(time.perf_counter() - started)
+    scheduled_step_seconds = 0.75 * step_times[1] + 0.25 * step_times[2]
+    return {
+        "loss": float(losses["loss"].detach()),
+        "cfm_loss": float(losses["cfm_loss"].detach()),
+        "roundtrip_loss": float(losses["roundtrip_loss"].detach()),
+        "micro_batch": 512,
+        "roundtrip_samples": 16,
+        "roundtrip_solver_steps_per_direction": 2,
+        "condition_dropout": 0.1,
+        "guidance_scale": 1.5,
+        "first_step_seconds": step_times[0],
+        "steady_cfm_step_seconds": step_times[1],
+        "steady_roundtrip_step_seconds": step_times[2],
+        "scheduled_average_step_seconds": scheduled_step_seconds,
+        "estimated_four_gpu_samples_per_second": 512 * 4 / scheduled_step_seconds,
+    }
+
+
 def transport_inference(device: torch.device) -> dict[str, float | int | str]:
     model = _flow(device).eval()
     latent = torch.randn(1, LATENT_TOKENS, LATENT_DIM, device=device)
@@ -269,6 +337,7 @@ CASES: dict[str, Case] = {
     "codec_decode": codec_decode,
     "evaluator_train": evaluator_train,
     "transport_train": transport_train,
+    "unified_cfm_train": unified_cfm_train,
     "transport_inference": transport_inference,
     "cfm_abduction_train": cfm_abduction_train,
     "ddim_abduction_train": ddim_abduction_train,

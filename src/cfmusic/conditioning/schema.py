@@ -31,6 +31,7 @@ class ConditionBatch:
     style_id: Tensor
     genre_id: Tensor | None = None
     emotion_id: Tensor | None = None
+    condition_mask: Tensor | None = None
 
     def to(self, device: str | torch.device | Tensor) -> ConditionBatch:
         target = device.device if isinstance(device, Tensor) else device
@@ -40,6 +41,7 @@ class ConditionBatch:
             self.style_id.to(target),
             self.genre_id.to(target) if self.genre_id is not None else None,
             self.emotion_id.to(target) if self.emotion_id is not None else None,
+            self.condition_mask.to(target) if self.condition_mask is not None else None,
         )
 
     def index_select(self, indices: Tensor) -> ConditionBatch:
@@ -49,11 +51,51 @@ class ConditionBatch:
             self.style_id.index_select(0, indices),
             self.genre_id.index_select(0, indices) if self.genre_id is not None else None,
             self.emotion_id.index_select(0, indices) if self.emotion_id is not None else None,
+            self.condition_mask.index_select(0, indices)
+            if self.condition_mask is not None
+            else None,
         )
 
     @property
     def batch_size(self) -> int:
         return self.style_id.shape[0]
+
+    def with_condition_mask(self, mask: Tensor) -> ConditionBatch:
+        """Return a batch whose semantic labels are gated by one mask per sample."""
+
+        values = mask.to(device=self.style_id.device, dtype=torch.float32).reshape(-1)
+        if values.shape[0] != self.batch_size:
+            raise ValueError(
+                f"Condition mask has batch {values.shape[0]}, expected {self.batch_size}"
+            )
+        if self.condition_mask is not None:
+            values = values * self.condition_mask.to(values)
+        return ConditionBatch(
+            self.dataset_id,
+            self.task_id,
+            self.style_id,
+            self.genre_id,
+            self.emotion_id,
+            values,
+        )
+
+    def unconditional(self) -> ConditionBatch:
+        """Drop style/factor labels while retaining dataset and task context."""
+
+        return self.with_condition_mask(torch.zeros(self.batch_size, device=self.style_id.device))
+
+
+def apply_condition_dropout(
+    condition: ConditionBatch, probability: float
+) -> tuple[ConditionBatch, Tensor]:
+    """Apply per-example classifier-free condition dropout during training."""
+
+    if not 0.0 <= probability < 1.0:
+        raise ValueError("condition_dropout must be in [0, 1)")
+    if probability == 0.0:
+        return condition, condition.style_id.new_zeros((), dtype=torch.float32)
+    keep = torch.rand(condition.batch_size, device=condition.style_id.device) >= probability
+    return condition.with_condition_mask(keep), (~keep).float().mean()
 
 
 def condition_task(task: str, *, factorial: bool = False) -> ConditionTask:
@@ -162,8 +204,8 @@ def validate_condition_checkpoint(
     expected = condition_schema_provenance(task=task, factorial=factorial)
     if recorded_version != CONDITION_SCHEMA_VERSION:
         raise ValueError(
-            "Transport checkpoint uses an old or unknown condition schema; retrain Stage 1 "
-            "and Stage 2 with task-aware-v2 before generation or resume"
+            "Transport checkpoint uses an old or unknown condition schema; retrain the "
+            "transport with task-aware-v2 before generation or resume"
         )
     if recorded_task != expected["condition_task"]:
         raise ValueError(

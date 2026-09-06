@@ -23,6 +23,7 @@ from cfmusic.distributed import (
 from cfmusic.latent.dataset import LatentDataset
 from cfmusic.logging import MetricLogger
 from cfmusic.losses.mmd import class_conditional_mmd
+from cfmusic.losses.roundtrip import roundtrip_loss
 from cfmusic.losses.sliced_wasserstein import class_conditional_sliced_wasserstein
 from cfmusic.memory import (
     autocast_context,
@@ -53,8 +54,13 @@ class TransportLossModule(nn.Module):
         condition_contrast_weight: float,
         condition_contrast_margin: float,
         condition_contrast_samples: int | None,
+        roundtrip_weight: float,
+        roundtrip_steps: int,
+        roundtrip_samples: int | None,
+        roundtrip_cosine_weight: float,
     ) -> dict[str, Tensor]:
-        return cast(ConditionalTransport, self.transport).training_loss(
+        transport = cast(ConditionalTransport, self.transport)
+        losses = transport.training_loss(
             latent,
             condition,
             negative_condition=negative_condition,
@@ -63,6 +69,27 @@ class TransportLossModule(nn.Module):
             condition_contrast_samples=condition_contrast_samples,
             sample_weight=sample_weight,
         )
+        consistency = latent.new_zeros(())
+        if roundtrip_weight > 0:
+            count = latent.shape[0]
+            if roundtrip_samples is not None:
+                count = min(count, max(1, roundtrip_samples))
+            indices = torch.randperm(latent.shape[0], device=latent.device)[:count]
+            factual = latent.index_select(0, indices)
+            factual_condition = condition.index_select(indices)
+            noise = transport.abduct(
+                factual, factual_condition, num_steps=roundtrip_steps, track_grad=True
+            )
+            reconstructed = transport.predict(
+                noise, factual_condition, num_steps=roundtrip_steps, track_grad=True
+            )
+            consistency = roundtrip_loss(
+                reconstructed.float(), factual.float(), cosine_weight=roundtrip_cosine_weight
+            )
+            losses["loss"] = losses["loss"] + roundtrip_weight * consistency
+        losses["roundtrip_loss"] = consistency
+        losses["roundtrip_weight"] = latent.new_tensor(roundtrip_weight)
+        return losses
 
 
 def _different_labels(values: Tensor, vocabulary: Sequence[int]) -> Tensor:
@@ -109,6 +136,7 @@ def contrasting_conditions(
             condition.style_id,
             genres,
             emotions,
+            condition.condition_mask,
         )
     return ConditionBatch(
         condition.dataset_id,
@@ -116,6 +144,7 @@ def contrasting_conditions(
         _different_labels(condition.style_id, vocabularies["style_id"]),
         condition.genre_id,
         condition.emotion_id,
+        condition.condition_mask,
     )
 
 
@@ -151,6 +180,7 @@ def shifted_conditions(
             shift(condition.emotion_id, "emotion_id")
             if axis == "emotion"
             else condition.emotion_id,
+            condition.condition_mask,
         )
     return ConditionBatch(
         condition.dataset_id,
@@ -158,7 +188,20 @@ def shifted_conditions(
         shift(condition.style_id, "style_id"),
         condition.genre_id,
         condition.emotion_id,
+        condition.condition_mask,
     )
+
+
+def roundtrip_schedule_scale(step: int, *, warmup_steps: int, ramp_steps: int) -> float:
+    """Delay consistency training until the CFM field has learned a useful path."""
+
+    if warmup_steps < 0 or ramp_steps < 0:
+        raise ValueError("Round-trip warmup and ramp steps must be non-negative")
+    if step < warmup_steps:
+        return 0.0
+    if ramp_steps == 0:
+        return 1.0
+    return min(1.0, (step - warmup_steps + 1) / ramp_steps)
 
 
 def inverse_frequency_weights(labels: Sequence[int], *, exponent: float) -> dict[int, float]:
@@ -419,6 +462,13 @@ def train_transport_steps(
     validation_batch: Mapping[str, Tensor | str | int] | None = None,
     validation_seed: int = 2026,
     validation_solver_steps: int = 8,
+    roundtrip_weight: float = 0.0,
+    roundtrip_warmup_steps: int = 0,
+    roundtrip_ramp_steps: int = 0,
+    roundtrip_interval: int = 1,
+    roundtrip_inverse_steps: int = 2,
+    roundtrip_samples_per_batch: int | None = None,
+    roundtrip_cosine_weight: float = 0.1,
     resume_from: Path | None = None,
     distributed: DistributedContext | None = None,
 ) -> TrainState:
@@ -432,6 +482,12 @@ def train_transport_steps(
         raise ValueError("Condition contrast weight and margin must be non-negative")
     if condition_contrast_weight > 0 and condition_vocabularies is None:
         raise ValueError("Condition contrast requires observed-label vocabularies")
+    if roundtrip_weight < 0 or roundtrip_cosine_weight < 0:
+        raise ValueError("Round-trip weights must be non-negative")
+    if roundtrip_interval <= 0 or roundtrip_inverse_steps <= 0:
+        raise ValueError("Round-trip interval and inverse steps must be positive")
+    if roundtrip_samples_per_batch is not None and roundtrip_samples_per_batch <= 0:
+        raise ValueError("roundtrip_samples_per_batch must be positive or null")
     context = distributed or DistributedContext(0, 0, 1, device)
     state = TrainState()
     ema = ExponentialMovingAverage(transport, ema_decay) if ema_decay else None
@@ -480,6 +536,9 @@ def train_transport_steps(
     report_started = perf_counter()
     report_samples = 0
     report_steps = 0
+    report_roundtrip = torch.zeros((), device=device)
+    report_roundtrip_weight = 0.0
+    report_roundtrip_steps = 0
     while state.global_step < max_steps:
         set_data_epoch(batches, state.epoch)
         saw_batch = False
@@ -511,6 +570,17 @@ def train_transport_steps(
                 if style_weight_lookup is not None and not factorial_conditioning
                 else None
             )
+            roundtrip_scale = roundtrip_schedule_scale(
+                state.global_step,
+                warmup_steps=roundtrip_warmup_steps,
+                ramp_steps=roundtrip_ramp_steps,
+            )
+            run_roundtrip = (
+                roundtrip_weight > 0
+                and roundtrip_scale > 0
+                and (state.global_step - roundtrip_warmup_steps) % roundtrip_interval == 0
+            )
+            active_roundtrip_weight = roundtrip_weight * roundtrip_scale if run_roundtrip else 0.0
             report_samples += latent.shape[0]
             last_batch = batch_count is not None and batch_index + 1 == batch_count
             synchronize = (batch_index + 1) % gradient_accumulation == 0 or last_batch
@@ -527,6 +597,10 @@ def train_transport_steps(
                         condition_contrast_weight=condition_contrast_weight,
                         condition_contrast_margin=condition_contrast_margin,
                         condition_contrast_samples=condition_contrast_samples,
+                        roundtrip_weight=active_roundtrip_weight,
+                        roundtrip_steps=roundtrip_inverse_steps,
+                        roundtrip_samples=roundtrip_samples_per_batch,
+                        roundtrip_cosine_weight=roundtrip_cosine_weight,
                     )
                     loss = losses["loss"] / gradient_accumulation
                 scaler.scale(loss).backward()
@@ -551,6 +625,10 @@ def train_transport_steps(
             state.global_step += 1
             state.batch_in_epoch = batch_index + 1
             report_steps += 1
+            if active_roundtrip_weight > 0:
+                report_roundtrip += losses["roundtrip_loss"].detach()
+                report_roundtrip_weight += active_roundtrip_weight
+                report_roundtrip_steps += 1
             progress.update(1)
             report = (
                 state.global_step == 1
@@ -571,6 +649,11 @@ def train_transport_steps(
                 metrics.update(
                     {key: float(value.detach()) for key, value in losses.items() if key != "loss"}
                 )
+                metrics["roundtrip_loss"] = float(report_roundtrip / max(1, report_roundtrip_steps))
+                metrics["roundtrip_weight"] = report_roundtrip_weight / max(
+                    1, report_roundtrip_steps
+                )
+                metrics["roundtrip_active_fraction"] = report_roundtrip_steps / report_steps
                 if (
                     context.is_main
                     and validation_batch is not None
@@ -612,6 +695,9 @@ def train_transport_steps(
                 report_started = perf_counter()
                 report_samples = 0
                 report_steps = 0
+                report_roundtrip.zero_()
+                report_roundtrip_weight = 0.0
+                report_roundtrip_steps = 0
             if state.global_step % checkpoint_interval == 0 or state.global_step == max_steps:
                 if context.is_main:
                     save_rolling_checkpoint(

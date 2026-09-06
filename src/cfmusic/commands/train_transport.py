@@ -38,7 +38,7 @@ from cfmusic.training.transport_trainer import (
     inverse_frequency_weights,
     train_transport_steps,
 )
-from cfmusic.transport.factory import create_transport
+from cfmusic.transport.factory import create_transport, validate_guidance_checkpoint
 
 
 def _train(cfg: DictConfig, context: DistributedContext) -> None:
@@ -125,6 +125,18 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         if bool(condition_objective.get("enabled", False))
         else 0.0
     )
+    roundtrip_config = cfg.transport.get("roundtrip", {})
+    roundtrip_weight = (
+        float(roundtrip_config.get("weight", 0.0))
+        if bool(roundtrip_config.get("enabled", False))
+        else 0.0
+    )
+    if roundtrip_weight > 0 and str(cfg.transport.type) != "cfm":
+        raise ValueError("The unified round-trip objective currently requires transport.type=cfm")
+    checkpoint_subdir = str(cfg.experiment.get("checkpoint_subdir", "transport_stage1"))
+    if Path(checkpoint_subdir).name != checkpoint_subdir or checkpoint_subdir in {"", ".", ".."}:
+        raise ValueError(f"Invalid transport checkpoint subdirectory: {checkpoint_subdir!r}")
+    checkpoint_dir = paths["checkpoints_dir"] / str(cfg.experiment.name) / checkpoint_subdir
     validation_batch: dict[str, torch.Tensor] | None = None
     if context.is_main and isinstance(dataset, LatentDataset):
         validation_dataset = LatentDataset(
@@ -156,7 +168,6 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         dataset.refresh_index()
         import json
 
-        checkpoint_dir = paths["checkpoints_dir"] / str(cfg.experiment.name) / "transport_stage1"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         if context.is_main:
             (checkpoint_dir / "label_shuffle.json").write_text(
@@ -206,7 +217,6 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     scheduler = warmup_cosine_scheduler(
         optimizer, warmup_steps=min(int(training.warmup_steps), max_steps), max_steps=max_steps
     )
-    checkpoint_dir = paths["checkpoints_dir"] / str(cfg.experiment.name) / "transport_stage1"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     explicit_resume = Path(str(cfg.resume_from)) if cfg.resume_from is not None else None
     resume_checkpoint = resolve_resume_checkpoint(
@@ -221,6 +231,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
             raise TypeError("Transport checkpoint must contain a mapping")
         validate_transport_cache_provenance(resumed, cache_metadata)
         validate_condition_checkpoint(resumed, task=task, factorial=factorial)
+        validate_guidance_checkpoint(resumed, cfg.transport, exact_training_match=True)
         del resumed
     if context.is_main:
         global_batch = (
@@ -237,10 +248,27 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
             formatted = ", ".join(
                 f"{style}:{weight:.3f}" for style, weight in sorted(style_loss_weights.items())
             )
-            print(f"Stage-1 class-balanced loss weights (mean=1): {formatted}")
+            print(f"Transport class-balanced loss weights (mean=1): {formatted}")
+        if bool(cfg.transport.get("classifier_free_guidance", False)):
+            print(
+                "Classifier-free guidance: "
+                f"condition_dropout={float(cfg.transport.get('condition_dropout', 0.0)):g}, "
+                f"inference_scale={float(cfg.transport.get('guidance_scale', 1.0)):g} "
+                "(abduction and prediction)"
+            )
+        if roundtrip_weight > 0:
+            print(
+                "Unified CFM round-trip objective: "
+                f"weight={roundtrip_weight:g}, "
+                f"warmup={int(roundtrip_config.get('warmup_steps', 0))}, "
+                f"ramp={int(roundtrip_config.get('ramp_steps', 0))}, "
+                f"interval={int(roundtrip_config.get('interval', 1))}, "
+                f"solver_steps={int(roundtrip_config.get('inverse_steps', 2))}, "
+                f"samples/rank={int(roundtrip_config.get('samples_per_batch', 0)) or 'all'}"
+            )
         if condition_contrast_weight > 0:
             print(
-                "Stage-1 condition contrast: "
+                "Transport condition contrast: "
                 f"weight={condition_contrast_weight:g}, "
                 f"margin={float(condition_objective.get('margin', 0.0)):g}, "
                 f"samples/rank={int(condition_objective.get('samples_per_batch', 0))}"
@@ -279,6 +307,13 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         validation_batch=validation_batch,
         validation_seed=int(cfg.seed) + 2026,
         validation_solver_steps=int(training.get("validation_solver_steps", 8)),
+        roundtrip_weight=roundtrip_weight,
+        roundtrip_warmup_steps=int(roundtrip_config.get("warmup_steps", 0)),
+        roundtrip_ramp_steps=int(roundtrip_config.get("ramp_steps", 0)),
+        roundtrip_interval=int(roundtrip_config.get("interval", 1)),
+        roundtrip_inverse_steps=int(roundtrip_config.get("inverse_steps", 2)),
+        roundtrip_samples_per_batch=(int(roundtrip_config.get("samples_per_batch", 0)) or None),
+        roundtrip_cosine_weight=float(roundtrip_config.get("cosine_weight", 0.1)),
         ema_decay=float(training.get("ema_decay", 0.9999)),
         ema_update_interval=int(training.get("ema_update_interval", 10)),
         log_interval=int(training.get("log_interval", 10)),

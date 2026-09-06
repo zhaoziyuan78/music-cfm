@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from omegaconf import DictConfig
 
 from cfmusic.conditioning.embeddings import AdditiveConditionEmbedding
@@ -12,6 +14,54 @@ from cfmusic.transport.conditional_ddim import ConditionalDDIM
 from cfmusic.transport.conditional_flow import ConditionalFlow
 from cfmusic.transport.independent_flows import IndependentStyleFlows
 from cfmusic.transport.split_transport import SplitConditionalTransport
+
+
+def validate_guidance_checkpoint(
+    checkpoint: Mapping[str, object],
+    cfg: DictConfig,
+    *,
+    exact_training_match: bool,
+) -> None:
+    """Prevent CFG inference/resume with a checkpoint that never learned a null condition."""
+
+    requested = bool(cfg.get("classifier_free_guidance", False))
+    saved_config = checkpoint.get("config")
+    saved = (
+        bool(saved_config.get("classifier_free_guidance", False))
+        if isinstance(saved_config, Mapping)
+        else False
+    )
+    saved_dropout = (
+        float(saved_config.get("condition_dropout", 0.0))
+        if isinstance(saved_config, Mapping)
+        else 0.0
+    )
+    saved_scale = (
+        float(saved_config.get("guidance_scale", 1.0))
+        if isinstance(saved_config, Mapping)
+        else 1.0
+    )
+    requested_dropout = float(cfg.get("condition_dropout", 0.0))
+    requested_scale = float(cfg.get("guidance_scale", 1.0))
+    if requested and (not saved or saved_dropout <= 0):
+        raise ValueError(
+            "Classifier-free guidance requires a checkpoint trained with positive condition "
+            "dropout; disable CFG for this checkpoint or train the unified CFG recipe"
+        )
+    if exact_training_match and (
+        requested != saved
+        or (
+            requested
+            and (
+                abs(requested_dropout - saved_dropout) > 1e-12
+                or abs(requested_scale - saved_scale) > 1e-12
+            )
+        )
+    ):
+        raise ValueError(
+            "Cannot resume with different classifier-free-guidance, condition-dropout, or "
+            "guidance-scale settings"
+        )
 
 
 def _embedding(cfg: DictConfig) -> AdditiveConditionEmbedding:
@@ -59,6 +109,9 @@ def create_transport(
         ot_solver=str(ot_cfg.solver) if str(cfg.flow.path) == "ot" and ot_cfg else None,
         ot_projection_dim=int(ot_cfg.cost_projection_dim) if ot_cfg else 128,
         ot_regularization=float(ot_cfg.regularization) if ot_cfg else 0.05,
+        classifier_free_guidance=bool(cfg.get("classifier_free_guidance", False)),
+        condition_dropout=float(cfg.get("condition_dropout", 0.0)),
+        guidance_scale=float(cfg.get("guidance_scale", 1.0)),
     )
     if bool(cfg.get("independent_per_style", False)):
         return IndependentStyleFlows(flow, int(cfg.conditioning.num_styles))

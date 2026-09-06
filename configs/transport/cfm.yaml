@@ -6,6 +6,7 @@ flow: {path: independent, time_sampling: uniform}
 solver: {method: heun, num_steps: 32}
 training: {batch_size: 512, gradient_accumulation: 1, learning_rate: 0.0001, weight_decay: 0.01, max_steps: 50000, max_epochs: 60, min_steps: 5000, warmup_steps: 1500, gradient_clip_norm: 1.0, precision: bf16, sdpa_backend: math, checkpoint_interval: 2500, dataloader_workers: 2, prefetch_factor: 2, log_interval: 10, ema_decay: 0.9999, ema_update_interval: 10, class_balance_exponent: 0.5, validation_samples_per_style: 16}
 condition_objective: {enabled: false, weight: 0.0, margin: 0.0, samples_per_batch: 0}
+roundtrip: {enabled: false, weight: 0.0, warmup_steps: 5000, ramp_steps: 5000, interval: 4, inverse_steps: 2, samples_per_batch: 16, cosine_weight: 0.1}
 classifier_free_guidance: false
 condition_dropout: 0.0
 guidance_scale: 1.0

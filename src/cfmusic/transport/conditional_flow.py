@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from cfmusic.conditioning.schema import ConditionBatch
+from cfmusic.conditioning.schema import ConditionBatch, apply_condition_dropout
 from cfmusic.solvers.ode import FixedGridODESolver
 from cfmusic.solvers.schedules import sample_flow_time
 from cfmusic.transport.counterfactual import CounterfactualOutput
@@ -25,12 +25,14 @@ def cfm_loss(
     condition_contrast_margin: float = 0.0,
     condition_contrast_samples: int | None = None,
     sample_weight: Tensor | None = None,
+    condition_dropout: float = 0.0,
 ) -> dict[str, Tensor]:
     base_noise = torch.randn_like(latent) if noise is None else noise
     time = sample_flow_time(latent.shape[0], latent.device, time_sampling)
     state = (1 - time[:, None, None]) * base_noise + time[:, None, None] * latent
     target = latent - base_noise
-    prediction = model(state, time, condition)
+    model_condition, dropout_fraction = apply_condition_dropout(condition, condition_dropout)
+    prediction = model(state, time, model_condition)
     per_sample_error = functional.mse_loss(prediction, target, reduction="none").flatten(1).mean(1)
     if sample_weight is None:
         cfm = per_sample_error.mean()
@@ -66,7 +68,21 @@ def cfm_loss(
             .flatten(1)
             .mean(1)
         )
-        correct_error = per_sample_error.index_select(0, indices)
+        if condition_dropout > 0 or condition.condition_mask is not None:
+            correct_prediction = model(
+                state.index_select(0, indices),
+                time.index_select(0, indices),
+                condition.index_select(indices),
+            )
+            correct_error = (
+                functional.mse_loss(
+                    correct_prediction, target.index_select(0, indices), reduction="none"
+                )
+                .flatten(1)
+                .mean(1)
+            )
+        else:
+            correct_error = per_sample_error.index_select(0, indices)
         gaps = negative_error - correct_error
         contrast_values = functional.relu(condition_contrast_margin - gaps)
         if sample_weight is None:
@@ -90,6 +106,7 @@ def cfm_loss(
         "condition_correct_error": condition_correct_error,
         "condition_wrong_error": condition_wrong_error,
         "time_mean": time.mean(),
+        "condition_dropout_fraction": dropout_fraction,
     }
 
 
@@ -103,6 +120,9 @@ class ConditionalFlow(nn.Module):
         ot_solver: str | None = None,
         ot_projection_dim: int = 128,
         ot_regularization: float = 0.05,
+        classifier_free_guidance: bool = False,
+        condition_dropout: float = 0.0,
+        guidance_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.vector_field = vector_field
@@ -111,6 +131,17 @@ class ConditionalFlow(nn.Module):
         self.ot_solver = ot_solver
         self.ot_projection_dim = ot_projection_dim
         self.ot_regularization = ot_regularization
+        self.classifier_free_guidance = classifier_free_guidance
+        self.condition_dropout = condition_dropout if classifier_free_guidance else 0.0
+        self.guidance_scale = guidance_scale if classifier_free_guidance else 1.0
+        if not 0.0 <= self.condition_dropout < 1.0:
+            raise ValueError("condition_dropout must be in [0, 1)")
+        if self.classifier_free_guidance and self.condition_dropout <= 0:
+            raise ValueError(
+                "Classifier-free guidance training requires positive condition_dropout"
+            )
+        if self.guidance_scale < 0:
+            raise ValueError("guidance_scale must be non-negative")
 
     def training_loss(
         self,
@@ -147,9 +178,43 @@ class ConditionalFlow(nn.Module):
             condition_contrast_margin=condition_contrast_margin,
             condition_contrast_samples=condition_contrast_samples,
             sample_weight=sample_weight,
+            condition_dropout=self.condition_dropout,
         )
         losses["ot_fallback_ratio"] = latent.new_tensor(fallback)
         return losses
+
+    def _guided_vector_field(
+        self, state: Tensor, time: Tensor, condition: ConditionBatch
+    ) -> Tensor:
+        """Evaluate conditional and null branches together for efficient CFG."""
+
+        if not self.classifier_free_guidance or self.guidance_scale == 1.0:
+            return self.vector_field(state, time, condition)
+
+        conditional_mask = (
+            condition.condition_mask.to(device=state.device, dtype=torch.float32)
+            if condition.condition_mask is not None
+            else torch.ones(condition.batch_size, device=state.device)
+        )
+
+        def duplicate(value: Tensor | None) -> Tensor | None:
+            return torch.cat((value, value), dim=0) if value is not None else None
+
+        combined_condition = ConditionBatch(
+            torch.cat((condition.dataset_id, condition.dataset_id), dim=0),
+            torch.cat((condition.task_id, condition.task_id), dim=0),
+            torch.cat((condition.style_id, condition.style_id), dim=0),
+            duplicate(condition.genre_id),
+            duplicate(condition.emotion_id),
+            torch.cat((torch.zeros_like(conditional_mask), conditional_mask), dim=0),
+        )
+        combined_prediction = self.vector_field(
+            torch.cat((state, state), dim=0),
+            torch.cat((time, time), dim=0),
+            combined_condition,
+        )
+        unconditional, conditional = combined_prediction.chunk(2, dim=0)
+        return unconditional + self.guidance_scale * (conditional - unconditional)
 
     def _integrate(
         self,
@@ -161,8 +226,9 @@ class ConditionalFlow(nn.Module):
         num_steps: int,
         track_grad: bool,
     ) -> tuple[Tensor, int]:
+        guided = self.classifier_free_guidance and self.guidance_scale != 1.0
         result = self.solver.integrate(
-            self.vector_field,
+            self._guided_vector_field if guided else self.vector_field,
             state,
             condition,
             t_start=t_start,
@@ -172,7 +238,7 @@ class ConditionalFlow(nn.Module):
         )
         if result.nan_count:
             raise FloatingPointError(f"ODE integration produced {result.nan_count} NaNs")
-        return result.state, result.nfe
+        return result.state, result.nfe * (2 if guided else 1)
 
     def abduct(
         self, latent: Tensor, condition: ConditionBatch, *, num_steps: int, track_grad: bool = False

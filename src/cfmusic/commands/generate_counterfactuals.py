@@ -45,7 +45,7 @@ from cfmusic.memory import autocast_context, peak_memory_gib, reset_peak_memory
 from cfmusic.progress import progress_bar, track
 from cfmusic.tokenization.factory import tokenizer_from_config
 from cfmusic.training.checkpointing import checkpoint_model_state
-from cfmusic.transport.factory import create_transport
+from cfmusic.transport.factory import create_transport, validate_guidance_checkpoint
 
 
 def select_source_indices(
@@ -125,6 +125,7 @@ def concatenate_conditions(conditions: list[ConditionBatch]) -> ConditionBatch:
         style_id,
         combine("genre_id"),
         combine("emotion_id"),
+        combine("condition_mask"),
     )
 
 
@@ -305,6 +306,7 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
     factorial = bool(cfg.experiment.get("factorial", False))
     task = str(cfg.data.get("task", cfg.task))
     validate_condition_checkpoint(transport_checkpoint, task=task, factorial=factorial)
+    validate_guidance_checkpoint(transport_checkpoint, cfg.transport, exact_training_match=False)
     transport_weights = str(cfg.counterfactual.get("transport_weights", "raw"))
     _load_model_state(transport, transport_checkpoint, weights=transport_weights)
     del transport_checkpoint
@@ -318,6 +320,10 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 ),
                 "deterministic_decode": bool(cfg.counterfactual.get("deterministic_decode", True)),
                 "tokenizer_hash": tokenizer_digest,
+                "classifier_free_guidance": bool(
+                    cfg.transport.get("classifier_free_guidance", False)
+                ),
+                "guidance_scale": float(cfg.transport.get("guidance_scale", 1.0)),
             },
             sort_keys=True,
         ).encode()
@@ -695,6 +701,10 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 "source_midi_path": str(source_path) if source_path else None,
                 "inverse_nfe": first_output.inverse_nfe,
                 "forward_nfe": first_output.forward_nfe,
+                "classifier_free_guidance": bool(
+                    cfg.transport.get("classifier_free_guidance", False)
+                ),
+                "guidance_scale": float(cfg.transport.get("guidance_scale", 1.0)),
                 "noise_sha256": noise_digest,
                 "latent_roundtrip": roundtrip,
                 **generation_identity,
