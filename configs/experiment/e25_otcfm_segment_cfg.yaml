@@ -1,0 +1,76 @@
+# @package _global_
+defaults:
+  - override /data: xmidi
+  - override /transport: cfm
+  - override /independence: none
+
+experiment:
+  name: e25_otcfm_segment_cfg
+  stage: transport
+  checkpoint_subdir: transport
+
+transport:
+  flow:
+    path: ot
+    time_sampling: uniform_beta_mixture
+    ot:
+      solver: hungarian
+      cost_projection_dim: 128
+      regularization: 0.05
+  training:
+    batch_size: 384
+    gradient_accumulation: 1
+    max_steps: 50000
+    max_epochs: null
+    min_steps: 30000
+    class_balance_exponent: 0.0
+    shard_cache_size: 64
+  sampling:
+    balance_by_style: true
+    unique_song_per_batch: true
+    confidence_weighted: true
+    classes_per_batch: 6
+    samples_per_class: 64
+  classifier_free_guidance: true
+  condition_dropout: 0.1
+  abduction_guidance_scale: 1.0
+  reconstruction_guidance_scale: 1.0
+  prediction_guidance_scale: 2.0
+  source_repulsion_scale: 0.5
+  roundtrip:
+    enabled: true
+    weight: 0.05
+    warmup_steps: 5000
+    ramp_steps: 5000
+    interval: 8
+    offset: 0
+    inverse_steps: 4
+    samples_per_batch: 16
+    cosine_weight: 0.1
+  endpoint_matching:
+    enabled: true
+    weight: 0.05
+    warmup_steps: 5000
+    ramp_steps: 5000
+    interval: 8
+    offset: 2
+    solver_steps: 4
+    samples_per_style: 4
+  exogeneity:
+    enabled: true
+    hsic_weight: 0.002
+    prior_weight: 0.001
+    cross_class_mmd_weight: 0.002
+    cross_class_swd_weight: 0.002
+    warmup_steps: 5000
+    ramp_steps: 5000
+    interval: 8
+    offset: 4
+    inverse_steps: 4
+    samples_per_style: 4
+    projection_dim: 128
+    projection_views: 3
+    projection_seed: 2026
+    projection_refresh_interval: 1
+    block_tokens: 8
+    block_channels: 32

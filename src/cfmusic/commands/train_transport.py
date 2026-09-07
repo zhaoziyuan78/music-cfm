@@ -15,7 +15,10 @@ from cfmusic.conditioning.schema import (
     validate_condition_checkpoint,
 )
 from cfmusic.config import CONFIG_DIR, config_mapping, prepare_config
-from cfmusic.data.samplers import ShardBatchSampler
+from cfmusic.data.samplers import (
+    BalancedStyleShardBatchSampler,
+    ShardBatchSampler,
+)
 from cfmusic.distributed import (
     DistributedContext,
     cleanup_distributed,
@@ -28,6 +31,7 @@ from cfmusic.latent.compatibility import (
     validate_transport_cache_provenance,
 )
 from cfmusic.latent.dataset import LatentDataset
+from cfmusic.models.probes import DynamicNoiseProjector
 from cfmusic.paths import save_run_context
 from cfmusic.reproducibility import seed_everything
 from cfmusic.training.checkpointing import resolve_resume_checkpoint
@@ -48,6 +52,7 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         save_run_context(cfg, run_dir)
     seed_everything(int(cfg.seed))
     data_name = str(cfg.data.name)
+    training = cfg.transport.training
     latent_root = paths["latent_dir"] / data_name
     latent_index_value = cfg.data.get("latent_index")
     latent_index = (
@@ -66,7 +71,12 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         dataset = combined
         latent_datasets = combined.datasets
     else:
-        dataset = LatentDataset(latent_root, split="train", index_path=latent_index)
+        dataset = LatentDataset(
+            latent_root,
+            split="train",
+            index_path=latent_index,
+            shard_cache_size=int(training.get("shard_cache_size", 1)),
+        )
         dataset_names = [data_name]
         latent_datasets = [dataset]
     for name, latent_dataset in zip(dataset_names, latent_datasets, strict=True):
@@ -77,7 +87,6 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
             dataset_name=name,
         )
     cache_metadata = [latent_dataset.metadata for latent_dataset in latent_datasets]
-    training = cfg.transport.training
     factorial = bool(cfg.experiment.get("factorial", False))
     task = str(cfg.data.get("task", cfg.task))
     active_axis = str(cfg.counterfactual.get("factorial_intervention", "genre"))
@@ -133,6 +142,37 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     )
     if roundtrip_weight > 0 and str(cfg.transport.type) != "cfm":
         raise ValueError("The unified round-trip objective currently requires transport.type=cfm")
+    endpoint_config = cfg.transport.get("endpoint_matching", {})
+    endpoint_weight = (
+        float(endpoint_config.get("weight", 0.0))
+        if bool(endpoint_config.get("enabled", False))
+        else 0.0
+    )
+    exogeneity_config = cfg.transport.get("exogeneity", {})
+    exogeneity_weights = {
+        "hsic": float(exogeneity_config.get("hsic_weight", 0.0)),
+        "prior": float(exogeneity_config.get("prior_weight", 0.0)),
+        "cross_mmd": float(exogeneity_config.get("cross_class_mmd_weight", 0.0)),
+        "cross_swd": float(exogeneity_config.get("cross_class_swd_weight", 0.0)),
+    }
+    exogeneity_enabled = bool(exogeneity_config.get("enabled", False)) and any(
+        value > 0 for value in exogeneity_weights.values()
+    )
+    if not exogeneity_enabled:
+        exogeneity_weights = {name: 0.0 for name in exogeneity_weights}
+    noise_projector = (
+        DynamicNoiseProjector(
+            int(cfg.codec.latent_tokens) * int(cfg.codec.latent_dim),
+            int(exogeneity_config.get("projection_dim", 128)),
+            num_views=int(exogeneity_config.get("projection_views", 3)),
+            seed=int(exogeneity_config.get("projection_seed", 2026)),
+            refresh_interval=int(exogeneity_config.get("projection_refresh_interval", 1)),
+            block_tokens=int(exogeneity_config.get("block_tokens", 8)),
+            block_channels=int(exogeneity_config.get("block_channels", 32)),
+        )
+        if exogeneity_enabled
+        else None
+    )
     checkpoint_subdir = str(cfg.experiment.get("checkpoint_subdir", "transport_stage1"))
     if Path(checkpoint_subdir).name != checkpoint_subdir or checkpoint_subdir in {"", ".", ".."}:
         raise ValueError(f"Invalid transport checkpoint subdirectory: {checkpoint_subdir!r}")
@@ -177,18 +217,51 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
     shard_ids = getattr(dataset, "shard_ids", None)
     if not isinstance(shard_ids, list):
         raise TypeError("Latent datasets must expose shard_ids for locality-aware training")
-    batch_sampler = ShardBatchSampler(
-        shard_ids,
-        batch_size=int(training.batch_size),
-        sample_ids=(
-            dataset.frame["sample_id"].astype(str).tolist()
-            if isinstance(dataset, LatentDataset)
-            else None
-        ),
-        rank=context.rank,
-        world_size=context.world_size,
-        seed=int(cfg.seed),
-    )
+    sampling = cfg.transport.get("sampling", {})
+    batch_sampler: BalancedStyleShardBatchSampler | ShardBatchSampler
+    if bool(sampling.get("balance_by_style", False)):
+        if not isinstance(dataset, LatentDataset):
+            raise ValueError("Style-balanced shard sampling requires one latent dataset")
+        if not bool(sampling.get("unique_song_per_batch", True)):
+            raise ValueError("Balanced shard sampling requires unique_song_per_batch=true")
+        confidence_weighted = bool(sampling.get("confidence_weighted", False))
+        if confidence_weighted and "label_confidence_weight" not in dataset.frame:
+            raise ValueError(
+                "confidence_weighted=true requires label_confidence_weight in the latent overlay"
+            )
+        if not confidence_weighted:
+            dataset._sample_weights = None
+        classes_per_batch = int(sampling.get("classes_per_batch", len(label_values["style_id"])))
+        samples_per_class = int(sampling.get("samples_per_class", 64))
+        configured_batch = int(training.batch_size)
+        if classes_per_batch * samples_per_class != configured_batch:
+            raise ValueError(
+                "Balanced sampler classes_per_batch * samples_per_class must equal "
+                f"training.batch_size ({configured_batch})"
+            )
+        batch_sampler = BalancedStyleShardBatchSampler(
+            dataset.frame[balance_column].astype(int).tolist(),
+            shard_ids,
+            dataset.frame["sample_id"].astype(str).tolist(),
+            classes_per_batch=classes_per_batch,
+            samples_per_class=samples_per_class,
+            rank=context.rank,
+            world_size=context.world_size,
+            seed=int(cfg.seed),
+        )
+    else:
+        batch_sampler = ShardBatchSampler(
+            shard_ids,
+            batch_size=int(training.batch_size),
+            sample_ids=(
+                dataset.frame["sample_id"].astype(str).tolist()
+                if isinstance(dataset, LatentDataset)
+                else None
+            ),
+            rank=context.rank,
+            world_size=context.world_size,
+            seed=int(cfg.seed),
+        )
     workers = int(training.get("dataloader_workers", 2))
     loader = DataLoader(
         dataset,
@@ -249,12 +322,22 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
                 f"{style}:{weight:.3f}" for style, weight in sorted(style_loss_weights.items())
             )
             print(f"Transport class-balanced loss weights (mean=1): {formatted}")
+        if bool(sampling.get("balance_by_style", False)):
+            print(
+                "Transport batches: style-balanced, unique-song, shard-local; "
+                f"classes={int(sampling.get('classes_per_batch', 0))}, "
+                f"samples/class={int(sampling.get('samples_per_class', 0))}, "
+                f"confidence_weighted={bool(sampling.get('confidence_weighted', False))}"
+            )
         if bool(cfg.transport.get("classifier_free_guidance", False)):
+            legacy_scale = float(cfg.transport.get("guidance_scale", 1.0))
             print(
                 "Classifier-free guidance: "
                 f"condition_dropout={float(cfg.transport.get('condition_dropout', 0.0)):g}, "
-                f"inference_scale={float(cfg.transport.get('guidance_scale', 1.0)):g} "
-                "(abduction and prediction)"
+                f"abduction={float(cfg.transport.get('abduction_guidance_scale', legacy_scale)):g}, "
+                f"reconstruction={float(cfg.transport.get('reconstruction_guidance_scale', legacy_scale)):g}, "
+                f"prediction={float(cfg.transport.get('prediction_guidance_scale', legacy_scale)):g}, "
+                f"source_repulsion={float(cfg.transport.get('source_repulsion_scale', 0.0)):g}"
             )
         if roundtrip_weight > 0:
             print(
@@ -265,6 +348,23 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
                 f"interval={int(roundtrip_config.get('interval', 1))}, "
                 f"solver_steps={int(roundtrip_config.get('inverse_steps', 2))}, "
                 f"samples/rank={int(roundtrip_config.get('samples_per_batch', 0)) or 'all'}"
+            )
+        if endpoint_weight > 0:
+            print(
+                "Sparse endpoint matching: "
+                f"weight={endpoint_weight:g}, "
+                f"interval={int(endpoint_config.get('interval', 1))}, "
+                f"offset={int(endpoint_config.get('offset', 0))}, "
+                f"steps={int(endpoint_config.get('solver_steps', 4))}, "
+                f"samples/style/rank={int(endpoint_config.get('samples_per_style', 4))}"
+            )
+        if exogeneity_enabled:
+            print(
+                "Sparse unguided exogeneity: "
+                f"weights={exogeneity_weights}, "
+                f"interval={int(exogeneity_config.get('interval', 8))}, "
+                f"offset={int(exogeneity_config.get('offset', 0))}, "
+                f"steps={int(exogeneity_config.get('inverse_steps', 4))}"
             )
         if condition_contrast_weight > 0:
             print(
@@ -311,9 +411,28 @@ def _train(cfg: DictConfig, context: DistributedContext) -> None:
         roundtrip_warmup_steps=int(roundtrip_config.get("warmup_steps", 0)),
         roundtrip_ramp_steps=int(roundtrip_config.get("ramp_steps", 0)),
         roundtrip_interval=int(roundtrip_config.get("interval", 1)),
+        roundtrip_offset=int(roundtrip_config.get("offset", 0)),
         roundtrip_inverse_steps=int(roundtrip_config.get("inverse_steps", 2)),
         roundtrip_samples_per_batch=(int(roundtrip_config.get("samples_per_batch", 0)) or None),
         roundtrip_cosine_weight=float(roundtrip_config.get("cosine_weight", 0.1)),
+        endpoint_weight=endpoint_weight,
+        endpoint_warmup_steps=int(endpoint_config.get("warmup_steps", 0)),
+        endpoint_ramp_steps=int(endpoint_config.get("ramp_steps", 0)),
+        endpoint_interval=int(endpoint_config.get("interval", 1)),
+        endpoint_offset=int(endpoint_config.get("offset", 0)),
+        endpoint_solver_steps=int(endpoint_config.get("solver_steps", 4)),
+        endpoint_samples_per_style=int(endpoint_config.get("samples_per_style", 4)),
+        exogeneity_hsic_weight=exogeneity_weights["hsic"],
+        exogeneity_prior_weight=exogeneity_weights["prior"],
+        exogeneity_cross_mmd_weight=exogeneity_weights["cross_mmd"],
+        exogeneity_cross_swd_weight=exogeneity_weights["cross_swd"],
+        exogeneity_warmup_steps=int(exogeneity_config.get("warmup_steps", 0)),
+        exogeneity_ramp_steps=int(exogeneity_config.get("ramp_steps", 0)),
+        exogeneity_interval=int(exogeneity_config.get("interval", 8)),
+        exogeneity_offset=int(exogeneity_config.get("offset", 0)),
+        exogeneity_inverse_steps=int(exogeneity_config.get("inverse_steps", 4)),
+        exogeneity_samples_per_style=int(exogeneity_config.get("samples_per_style", 4)),
+        noise_projector=noise_projector,
         ema_decay=float(training.get("ema_decay", 0.9999)),
         ema_update_interval=int(training.get("ema_update_interval", 10)),
         log_interval=int(training.get("log_interval", 10)),

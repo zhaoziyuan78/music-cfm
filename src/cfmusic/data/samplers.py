@@ -93,6 +93,98 @@ class BalancedStyleBatchSampler(Sampler[list[int]]):
             yield batch
 
 
+class BalancedStyleShardBatchSampler(Sampler[list[int]]):
+    """Style-balanced, song-unique batches with rank-local shard assignment.
+
+    Each rank keeps a stable subset of mmap shards. Samples are balanced across
+    styles and sorted by shard inside a batch, avoiding the near-random shard
+    reload pattern of a conventional weighted sampler.
+    """
+
+    def __init__(
+        self,
+        labels: Sequence[int],
+        shard_ids: Sequence[str],
+        group_ids: Sequence[str],
+        *,
+        classes_per_batch: int,
+        samples_per_class: int,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ) -> None:
+        if not (len(labels) == len(shard_ids) == len(group_ids)) or not labels:
+            raise ValueError("labels, shard_ids, and group_ids must have equal non-zero length")
+        if classes_per_batch <= 0 or samples_per_class <= 0:
+            raise ValueError("Balanced shard batch dimensions must be positive")
+        if world_size <= 0 or rank < 0 or rank >= world_size:
+            raise ValueError("Invalid distributed rank/world_size")
+        shards = sorted(set(str(value) for value in shard_ids))
+        if len(shards) < world_size:
+            raise ValueError("Balanced shard sampling requires at least one shard per rank")
+        shard_rank = {shard: index % world_size for index, shard in enumerate(shards)}
+        rank_song_groups: list[set[tuple[int, str]]] = [set() for _ in range(world_size)]
+        for label, shard, group in zip(labels, shard_ids, group_ids, strict=True):
+            rank_song_groups[shard_rank[str(shard)]].add((int(label), str(group)))
+        rank_indices = [
+            index for index, shard in enumerate(shard_ids) if shard_rank[str(shard)] == rank
+        ]
+        by_class_group: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        for index in rank_indices:
+            by_class_group[int(labels[index])][str(group_ids[index])].append(index)
+        self.by_class_group = {label: dict(groups) for label, groups in by_class_group.items()}
+        self.classes = sorted(self.by_class_group)
+        if len(self.classes) < classes_per_batch:
+            raise ValueError(
+                f"Rank {rank} has only {len(self.classes)} styles; "
+                f"classes_per_batch={classes_per_batch} cannot be satisfied"
+            )
+        self.classes_per_batch = classes_per_batch
+        self.samples_per_class = samples_per_class
+        self.shard_ids = [str(value) for value in shard_ids]
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        for label, groups in self.by_class_group.items():
+            if len(groups) < samples_per_class:
+                raise ValueError(
+                    f"Rank {rank} style {label} has only {len(groups)} unique songs; "
+                    f"samples_per_class={samples_per_class} is too large"
+                )
+        batch_size = self.classes_per_batch * self.samples_per_class
+        # DDP ranks must yield exactly the same number of batches. Shorter rank
+        # partitions naturally resample balanced groups near the end of an epoch.
+        self._length = max(
+            1,
+            max(math.ceil(len(groups) / batch_size) for groups in rank_song_groups),
+        )
+
+    def __len__(self) -> int:
+        return self._length
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch * 10_007 + self.rank * 1_000_003)
+        for batch_index in range(self._length):
+            offset = batch_index * self.classes_per_batch
+            rotated = (
+                self.classes[offset % len(self.classes) :]
+                + self.classes[: offset % len(self.classes)]
+            )
+            chosen_classes = rotated[: self.classes_per_batch]
+            batch: list[int] = []
+            for label in chosen_classes:
+                groups = self.by_class_group[label]
+                chosen = rng.sample(sorted(groups), self.samples_per_class)
+                batch.extend(rng.choice(groups[group]) for group in chosen)
+            # Consecutive mmap reads stay in the same shard. Model loss is
+            # permutation-invariant across the batch.
+            batch.sort(key=lambda index: (self.shard_ids[index], index))
+            yield batch
+
+
 class ShardBatchSampler(Sampler[list[int]]):
     """Balance shard-local work over ranks, optionally sampling one segment per song.
 
@@ -355,8 +447,7 @@ class GroupedLengthBatchSampler(Sampler[list[int]]):
 
         useful = sum(length * length for length in self.lengths)
         padded = sum(
-            len(batch) * max(self.lengths[index] for index in batch) ** 2
-            for batch in self.batches
+            len(batch) * max(self.lengths[index] for index in batch) ** 2 for batch in self.batches
         )
         return useful / padded
 

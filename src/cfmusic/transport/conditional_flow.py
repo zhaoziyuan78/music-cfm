@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
@@ -123,6 +125,10 @@ class ConditionalFlow(nn.Module):
         classifier_free_guidance: bool = False,
         condition_dropout: float = 0.0,
         guidance_scale: float = 1.0,
+        abduction_guidance_scale: float | None = None,
+        reconstruction_guidance_scale: float | None = None,
+        prediction_guidance_scale: float | None = None,
+        source_repulsion_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.vector_field = vector_field
@@ -133,15 +139,33 @@ class ConditionalFlow(nn.Module):
         self.ot_regularization = ot_regularization
         self.classifier_free_guidance = classifier_free_guidance
         self.condition_dropout = condition_dropout if classifier_free_guidance else 0.0
-        self.guidance_scale = guidance_scale if classifier_free_guidance else 1.0
+        legacy_scale = guidance_scale if classifier_free_guidance else 1.0
+        self.abduction_guidance_scale = (
+            legacy_scale if abduction_guidance_scale is None else abduction_guidance_scale
+        )
+        self.reconstruction_guidance_scale = (
+            legacy_scale if reconstruction_guidance_scale is None else reconstruction_guidance_scale
+        )
+        self.prediction_guidance_scale = (
+            legacy_scale if prediction_guidance_scale is None else prediction_guidance_scale
+        )
+        self.source_repulsion_scale = source_repulsion_scale if classifier_free_guidance else 0.0
+        # Kept as a compatibility alias for old diagnostics and checkpoint metadata.
+        self.guidance_scale = self.prediction_guidance_scale
         if not 0.0 <= self.condition_dropout < 1.0:
             raise ValueError("condition_dropout must be in [0, 1)")
         if self.classifier_free_guidance and self.condition_dropout <= 0:
             raise ValueError(
                 "Classifier-free guidance training requires positive condition_dropout"
             )
-        if self.guidance_scale < 0:
-            raise ValueError("guidance_scale must be non-negative")
+        scales = (
+            self.abduction_guidance_scale,
+            self.reconstruction_guidance_scale,
+            self.prediction_guidance_scale,
+            self.source_repulsion_scale,
+        )
+        if any(scale < 0 for scale in scales):
+            raise ValueError("Guidance and source-repulsion scales must be non-negative")
 
     def training_loss(
         self,
@@ -184,37 +208,74 @@ class ConditionalFlow(nn.Module):
         return losses
 
     def _guided_vector_field(
-        self, state: Tensor, time: Tensor, condition: ConditionBatch
+        self,
+        state: Tensor,
+        time: Tensor,
+        condition: ConditionBatch,
+        *,
+        guidance_scale: float,
+        source_condition: ConditionBatch | None = None,
+        source_repulsion_scale: float = 0.0,
     ) -> Tensor:
-        """Evaluate conditional and null branches together for efficient CFG."""
+        """Evaluate null/target/source branches together for efficient guidance."""
 
-        if not self.classifier_free_guidance or self.guidance_scale == 1.0:
+        if not self.classifier_free_guidance or (
+            guidance_scale == 1.0 and source_repulsion_scale == 0.0
+        ):
             return self.vector_field(state, time, condition)
+        if source_repulsion_scale > 0 and source_condition is None:
+            raise ValueError("Source-repulsive guidance requires a source condition")
+        if source_condition is not None and source_condition.batch_size != condition.batch_size:
+            raise ValueError("Source and target guidance conditions must have equal batch size")
 
-        conditional_mask = (
-            condition.condition_mask.to(device=state.device, dtype=torch.float32)
-            if condition.condition_mask is not None
-            else torch.ones(condition.batch_size, device=state.device)
-        )
+        conditions = [condition.unconditional(), condition]
+        if source_repulsion_scale > 0:
+            assert source_condition is not None
+            conditions.append(source_condition)
 
-        def duplicate(value: Tensor | None) -> Tensor | None:
-            return torch.cat((value, value), dim=0) if value is not None else None
+        def combine(name: str) -> Tensor | None:
+            values = [getattr(value, name) for value in conditions]
+            if name == "condition_mask":
+                # ``None`` is the compact representation of an all-conditional
+                # branch, while ``unconditional()`` materializes an all-zero
+                # mask. Expand the implicit ones before concatenating branches.
+                masks = [
+                    torch.ones_like(value.style_id)
+                    if value.condition_mask is None
+                    else value.condition_mask
+                    for value in conditions
+                ]
+                return torch.cat(masks)
+            if all(value is None for value in values):
+                return None
+            if any(value is None for value in values):
+                raise ValueError(f"Inconsistent guidance condition field: {name}")
+            return torch.cat([cast(Tensor, value) for value in values])
 
+        dataset_id = combine("dataset_id")
+        task_id = combine("task_id")
+        style_id = combine("style_id")
+        assert dataset_id is not None and task_id is not None and style_id is not None
         combined_condition = ConditionBatch(
-            torch.cat((condition.dataset_id, condition.dataset_id), dim=0),
-            torch.cat((condition.task_id, condition.task_id), dim=0),
-            torch.cat((condition.style_id, condition.style_id), dim=0),
-            duplicate(condition.genre_id),
-            duplicate(condition.emotion_id),
-            torch.cat((torch.zeros_like(conditional_mask), conditional_mask), dim=0),
+            dataset_id,
+            task_id,
+            style_id,
+            combine("genre_id"),
+            combine("emotion_id"),
+            combine("condition_mask"),
         )
         combined_prediction = self.vector_field(
-            torch.cat((state, state), dim=0),
-            torch.cat((time, time), dim=0),
+            torch.cat([state] * len(conditions), dim=0),
+            torch.cat([time] * len(conditions), dim=0),
             combined_condition,
         )
-        unconditional, conditional = combined_prediction.chunk(2, dim=0)
-        return unconditional + self.guidance_scale * (conditional - unconditional)
+        branches = combined_prediction.chunk(len(conditions), dim=0)
+        unconditional, conditional = branches[:2]
+        guided = unconditional + guidance_scale * (conditional - unconditional)
+        if source_repulsion_scale > 0:
+            source = branches[2]
+            guided = guided - source_repulsion_scale * (source - unconditional)
+        return guided
 
     def _integrate(
         self,
@@ -225,10 +286,29 @@ class ConditionalFlow(nn.Module):
         t_end: float,
         num_steps: int,
         track_grad: bool,
+        guidance_scale: float = 1.0,
+        source_condition: ConditionBatch | None = None,
+        source_repulsion_scale: float = 0.0,
     ) -> tuple[Tensor, int]:
-        guided = self.classifier_free_guidance and self.guidance_scale != 1.0
+        guided = self.classifier_free_guidance and (
+            guidance_scale != 1.0 or source_repulsion_scale > 0.0
+        )
+        branch_count = 1 + int(guided) + int(guided and source_repulsion_scale > 0)
+
+        def vector_field(
+            current_state: Tensor, current_time: Tensor, current_condition: ConditionBatch
+        ) -> Tensor:
+            return self._guided_vector_field(
+                current_state,
+                current_time,
+                current_condition,
+                guidance_scale=guidance_scale,
+                source_condition=source_condition,
+                source_repulsion_scale=source_repulsion_scale,
+            )
+
         result = self.solver.integrate(
-            self._guided_vector_field if guided else self.vector_field,
+            vector_field if guided else self.vector_field,
             state,
             condition,
             t_start=t_start,
@@ -238,20 +318,77 @@ class ConditionalFlow(nn.Module):
         )
         if result.nan_count:
             raise FloatingPointError(f"ODE integration produced {result.nan_count} NaNs")
-        return result.state, result.nfe * (2 if guided else 1)
+        return result.state, result.nfe * branch_count
 
     def abduct(
-        self, latent: Tensor, condition: ConditionBatch, *, num_steps: int, track_grad: bool = False
+        self,
+        latent: Tensor,
+        condition: ConditionBatch,
+        *,
+        num_steps: int,
+        track_grad: bool = False,
+        guidance_scale: float | None = None,
     ) -> Tensor:
         return self._integrate(
-            latent, condition, t_start=1.0, t_end=0.0, num_steps=num_steps, track_grad=track_grad
+            latent,
+            condition,
+            t_start=1.0,
+            t_end=0.0,
+            num_steps=num_steps,
+            track_grad=track_grad,
+            guidance_scale=(
+                self.abduction_guidance_scale if guidance_scale is None else guidance_scale
+            ),
         )[0]
 
     def predict(
-        self, noise: Tensor, condition: ConditionBatch, *, num_steps: int, track_grad: bool = False
+        self,
+        noise: Tensor,
+        condition: ConditionBatch,
+        *,
+        num_steps: int,
+        track_grad: bool = False,
+        guidance_scale: float | None = None,
+        source_condition: ConditionBatch | None = None,
+        source_repulsion_scale: float | None = None,
+    ) -> Tensor:
+        repulsion = (
+            self.source_repulsion_scale
+            if source_repulsion_scale is None
+            else source_repulsion_scale
+        )
+        if source_condition is None:
+            repulsion = 0.0
+        return self._integrate(
+            noise,
+            condition,
+            t_start=0.0,
+            t_end=1.0,
+            num_steps=num_steps,
+            track_grad=track_grad,
+            guidance_scale=(
+                self.prediction_guidance_scale if guidance_scale is None else guidance_scale
+            ),
+            source_condition=source_condition,
+            source_repulsion_scale=repulsion,
+        )[0]
+
+    def reconstruct(
+        self,
+        noise: Tensor,
+        condition: ConditionBatch,
+        *,
+        num_steps: int,
+        track_grad: bool = False,
     ) -> Tensor:
         return self._integrate(
-            noise, condition, t_start=0.0, t_end=1.0, num_steps=num_steps, track_grad=track_grad
+            noise,
+            condition,
+            t_start=0.0,
+            t_end=1.0,
+            num_steps=num_steps,
+            track_grad=track_grad,
+            guidance_scale=self.reconstruction_guidance_scale,
         )[0]
 
     def counterfactual(
@@ -269,6 +406,7 @@ class ConditionalFlow(nn.Module):
             t_end=0.0,
             num_steps=num_steps,
             track_grad=False,
+            guidance_scale=self.abduction_guidance_scale,
         )
         reconstructed, reconstruction_nfe = self._integrate(
             noise,
@@ -277,6 +415,7 @@ class ConditionalFlow(nn.Module):
             t_end=1.0,
             num_steps=num_steps,
             track_grad=False,
+            guidance_scale=self.reconstruction_guidance_scale,
         )
         counterfactual, counterfactual_nfe = self._integrate(
             noise,
@@ -285,6 +424,9 @@ class ConditionalFlow(nn.Module):
             t_end=1.0,
             num_steps=num_steps,
             track_grad=False,
+            guidance_scale=self.prediction_guidance_scale,
+            source_condition=source_condition,
+            source_repulsion_scale=self.source_repulsion_scale,
         )
         return CounterfactualOutput(
             latent,

@@ -8,10 +8,10 @@ import math
 import os
 import random
 import shutil
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import hydra
 import pandas as pd
@@ -45,7 +45,10 @@ from cfmusic.memory import autocast_context, peak_memory_gib, reset_peak_memory
 from cfmusic.progress import progress_bar, track
 from cfmusic.tokenization.factory import tokenizer_from_config
 from cfmusic.training.checkpointing import checkpoint_model_state
+from cfmusic.transport.conditional_flow import ConditionalFlow
 from cfmusic.transport.factory import create_transport, validate_guidance_checkpoint
+
+QuotaKey = TypeVar("QuotaKey", bound=Hashable)
 
 
 def select_source_indices(
@@ -56,8 +59,15 @@ def select_source_indices(
     max_total: int | None,
     unique_sources: bool,
     seed: int,
+    policy: str = "balanced",
 ) -> list[int]:
-    """Select a balanced, deterministic subset without loading latent shards."""
+    """Select a deterministic subset without loading latent shards.
+
+    ``balanced`` preserves the historical round-robin selection. ``proportional``
+    uses exact largest-remainder quotas based on the eligible unique-source
+    population, which is useful when an evaluation should reflect the dataset's
+    empirical label distribution.
+    """
     if max_per_stratum <= 0:
         raise ValueError("max_sources_per_style must be positive")
     missing = [column for column in strata if column not in frame]
@@ -78,6 +88,24 @@ def select_source_indices(
     randomizer = random.Random(seed)
     for key in sorted(groups):
         randomizer.shuffle(groups[key])
+    if policy not in {"balanced", "proportional"}:
+        raise ValueError(f"Unknown source sampling policy: {policy!r}")
+
+    if policy == "proportional":
+        capacity = {key: min(len(indices), max_per_stratum) for key, indices in groups.items()}
+        limit = sum(capacity.values()) if max_total is None else int(max_total)
+        if limit <= 0:
+            raise ValueError("max_total_sources must be positive for proportional sampling")
+        quotas = largest_remainder_quotas(
+            {key: len(indices) for key, indices in groups.items()},
+            total=limit,
+            capacity=capacity,
+        )
+        return sorted(
+            index for key in sorted(groups) for index in groups[key][: quotas.get(key, 0)]
+        )
+
+    for key in sorted(groups):
         groups[key] = groups[key][:max_per_stratum]
 
     limit = sum(len(indices) for indices in groups.values())
@@ -101,6 +129,84 @@ def select_source_indices(
         depth += 1
     # Nearby indices tend to share an mmap shard, avoiding repeated shard reloads.
     return sorted(selected)
+
+
+def largest_remainder_quotas(
+    weights: Mapping[QuotaKey, int],
+    *,
+    total: int,
+    capacity: Mapping[QuotaKey, int] | None = None,
+) -> dict[QuotaKey, int]:
+    """Allocate an exact integer total in proportion to non-negative weights."""
+
+    if total < 0:
+        raise ValueError("Quota total cannot be negative")
+    positive = {key: int(value) for key, value in weights.items() if int(value) > 0}
+    if not positive:
+        if total:
+            raise ValueError("Cannot allocate a positive total from zero weights")
+        return {key: 0 for key in weights}
+    capacities = {key: int(capacity[key]) if capacity is not None else total for key in positive}
+    if any(value < 0 for value in capacities.values()):
+        raise ValueError("Quota capacities cannot be negative")
+    if total > sum(capacities.values()):
+        raise ValueError(
+            f"Requested {total} samples but only {sum(capacities.values())} are eligible"
+        )
+    weight_total = sum(positive.values())
+    ideals = {key: total * value / weight_total for key, value in positive.items()}
+    quotas = {key: min(capacities[key], math.floor(ideals[key])) for key in positive}
+    remaining = total - sum(quotas.values())
+    while remaining:
+        eligible = [key for key in positive if quotas[key] < capacities[key]]
+        if not eligible:
+            raise RuntimeError("Unable to satisfy proportional quota capacities")
+        # Dict insertion order breaks exact ties deterministically.
+        selected = max(eligible, key=lambda key: ideals[key] - quotas[key])
+        quotas[selected] += 1
+        remaining -= 1
+    return {key: quotas.get(key, 0) for key in weights}
+
+
+def proportional_target_assignments(
+    frame: pd.DataFrame,
+    selected_indices: list[int],
+    *,
+    stratum: str,
+    unique_sources: bool,
+    seed: int,
+) -> dict[int, int]:
+    """Assign one target per source using exact conditional empirical quotas."""
+
+    if stratum not in frame:
+        raise ValueError(f"Latent index is missing target stratum {stratum!r}")
+    population = frame
+    if unique_sources:
+        if "sample_id" not in population:
+            raise ValueError("unique_sources requires sample_id in the latent index")
+        population = population.loc[~population["sample_id"].astype(str).duplicated()]
+    weights = {
+        int(style): int(count)
+        for style, count in population[stratum].astype(int).value_counts().items()
+    }
+    selected_by_source: dict[int, list[int]] = {}
+    for index in selected_indices:
+        source = int(frame.iloc[index][stratum])
+        selected_by_source.setdefault(source, []).append(index)
+
+    assignments: dict[int, int] = {}
+    for source in sorted(selected_by_source):
+        source_indices = selected_by_source[source]
+        alternatives = {style: count for style, count in weights.items() if style != source}
+        quotas = largest_remainder_quotas(alternatives, total=len(source_indices))
+        targets = [style for style in sorted(quotas) for _ in range(quotas[style])]
+        randomizer = random.Random(seed + source * 1_000_003)
+        randomizer.shuffle(source_indices)
+        randomizer.shuffle(targets)
+        assignments.update(zip(source_indices, targets, strict=True))
+    if len(assignments) != len(selected_indices):
+        raise RuntimeError("Failed to assign one proportional target per selected source")
+    return assignments
 
 
 def concatenate_conditions(conditions: list[ConditionBatch]) -> ConditionBatch:
@@ -311,22 +417,60 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
     _load_model_state(transport, transport_checkpoint, weights=transport_weights)
     del transport_checkpoint
     transport.eval()
-    generation_config_hash = hashlib.sha256(
-        json.dumps(
+    source_sampling_policy = str(cfg.counterfactual.get("source_sampling_policy", "balanced"))
+    target_policy = str(cfg.counterfactual.target_policy)
+    legacy_guidance_scale = float(cfg.transport.get("guidance_scale", 1.0))
+    abduction_guidance_scale = float(
+        cfg.transport.get("abduction_guidance_scale", legacy_guidance_scale)
+    )
+    reconstruction_guidance_scale = float(
+        cfg.transport.get("reconstruction_guidance_scale", legacy_guidance_scale)
+    )
+    prediction_guidance_scale = float(
+        cfg.transport.get("prediction_guidance_scale", legacy_guidance_scale)
+    )
+    source_repulsion_scale = float(cfg.transport.get("source_repulsion_scale", 0.0))
+    generation_config = {
+        "solver_steps": int(cfg.transport.solver.num_steps),
+        "decode_length_multiplier": float(cfg.counterfactual.get("decode_length_multiplier", 1.1)),
+        "deterministic_decode": bool(cfg.counterfactual.get("deterministic_decode", True)),
+        "tokenizer_hash": tokenizer_digest,
+        "classifier_free_guidance": bool(cfg.transport.get("classifier_free_guidance", False)),
+    }
+    split_guidance_keys = {
+        "abduction_guidance_scale",
+        "reconstruction_guidance_scale",
+        "prediction_guidance_scale",
+        "source_repulsion_scale",
+    }
+    if split_guidance_keys.intersection(cfg.transport):
+        generation_config.update(
             {
-                "solver_steps": int(cfg.transport.solver.num_steps),
-                "decode_length_multiplier": float(
-                    cfg.counterfactual.get("decode_length_multiplier", 1.1)
-                ),
-                "deterministic_decode": bool(cfg.counterfactual.get("deterministic_decode", True)),
-                "tokenizer_hash": tokenizer_digest,
-                "classifier_free_guidance": bool(
-                    cfg.transport.get("classifier_free_guidance", False)
-                ),
-                "guidance_scale": float(cfg.transport.get("guidance_scale", 1.0)),
-            },
-            sort_keys=True,
-        ).encode()
+                "abduction_guidance_scale": abduction_guidance_scale,
+                "reconstruction_guidance_scale": reconstruction_guidance_scale,
+                "prediction_guidance_scale": prediction_guidance_scale,
+                "source_repulsion_scale": source_repulsion_scale,
+            }
+        )
+    else:
+        # Keep old experiments byte-for-byte resume compatible.
+        generation_config["guidance_scale"] = legacy_guidance_scale
+    # Preserve the generation hash of historical balanced/all-other artifacts,
+    # while making non-default diagnostic sampling fully resume-safe.
+    if source_sampling_policy != "balanced" or target_policy != "all_other":
+        generation_config.update(
+            {
+                "source_sampling_policy": source_sampling_policy,
+                "target_policy": target_policy,
+                "targets_per_source": cfg.counterfactual.targets_per_source,
+                "max_sources_per_style": int(cfg.counterfactual.max_sources_per_style),
+                "max_total_sources": cfg.counterfactual.get("max_total_sources"),
+                "unique_sources": bool(cfg.counterfactual.get("unique_sources", True)),
+                "seed": int(cfg.seed),
+            }
+        )
+    generation_config_hash = hashlib.sha256(
+        json.dumps(generation_config, sort_keys=True).encode()
     ).hexdigest()
     generation_identity = {
         "artifact_schema_version": "3",
@@ -361,6 +505,7 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
         max_total=int(maximum_total) if maximum_total is not None else None,
         unique_sources=bool(cfg.counterfactual.get("unique_sources", True)),
         seed=int(cfg.seed),
+        policy=str(cfg.counterfactual.get("source_sampling_policy", "balanced")),
     )
     if not global_selected_indices:
         raise RuntimeError("No counterfactual source samples were selected")
@@ -407,8 +552,19 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
         else None
     )
     explicit_pairs = list(cfg.counterfactual.explicit_pairs)
+    proportional_targets: dict[int, int] = {}
+    if str(cfg.counterfactual.target_policy) == "proportional":
+        proportional_targets = proportional_target_assignments(
+            latent_dataset.frame,
+            global_selected_indices,
+            stratum=strata[0],
+            unique_sources=bool(cfg.counterfactual.get("unique_sources", True)),
+            seed=int(cfg.seed),
+        )
 
     def planned_targets(index: int) -> int:
+        if proportional_targets:
+            return 1
         row = latent_dataset.frame.iloc[index]
         if not factorial:
             return len(
@@ -477,14 +633,18 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 axis_source = source_genre if intervention == "genre" else source_emotion
                 evaluation_source_style = axis_source
                 axis_labels = genre_labels if intervention == "genre" else emotion_labels
-                target_ids = target_style_ids(
-                    axis_source,
-                    list(range(len(axis_labels))),
-                    policy=str(cfg.counterfactual.target_policy),
-                    targets_per_source=requested_targets,
-                    seed=int(cfg.seed) + index,
-                    labels=axis_labels,
-                    explicit_pairs=explicit_pairs,
+                target_ids = (
+                    [proportional_targets[index]]
+                    if proportional_targets
+                    else target_style_ids(
+                        axis_source,
+                        list(range(len(axis_labels))),
+                        policy=str(cfg.counterfactual.target_policy),
+                        targets_per_source=requested_targets,
+                        seed=int(cfg.seed) + index,
+                        labels=axis_labels,
+                        explicit_pairs=explicit_pairs,
+                    )
                 )
                 for target_id in target_ids:
                     target_genre = target_id if intervention == "genre" else source_genre
@@ -508,14 +668,18 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 raise ValueError(f"Unknown factorial intervention: {intervention}")
         else:
             source_condition = build_condition_batch(item, device, task=task, factorial=False)
-            target_ids = target_style_ids(
-                source_style,
-                styles,
-                policy=str(cfg.counterfactual.target_policy),
-                targets_per_source=requested_targets,
-                seed=int(cfg.seed) + index,
-                labels=labels,
-                explicit_pairs=explicit_pairs,
+            target_ids = (
+                [proportional_targets[index]]
+                if proportional_targets
+                else target_style_ids(
+                    source_style,
+                    styles,
+                    policy=str(cfg.counterfactual.target_policy),
+                    targets_per_source=requested_targets,
+                    seed=int(cfg.seed) + index,
+                    labels=labels,
+                    explicit_pairs=explicit_pairs,
+                )
             )
             source_name = labels[source_style] if source_style < len(labels) else str(source_style)
             for target_style in target_ids:
@@ -589,11 +753,22 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 )
                 batch_count = condition_batch.batch_size
                 repeated_noise = first_output.abducted_noise.expand(batch_count, -1, -1)
-                predicted = transport.predict(
-                    repeated_noise,
-                    condition_batch,
-                    num_steps=solver_steps,
-                )
+                if isinstance(transport, ConditionalFlow):
+                    source_batch = concatenate_conditions(
+                        [source_condition for _ in range(batch_count)]
+                    )
+                    predicted = transport.predict(
+                        repeated_noise,
+                        condition_batch,
+                        num_steps=solver_steps,
+                        source_condition=source_batch,
+                    )
+                else:
+                    predicted = transport.predict(
+                        repeated_noise,
+                        condition_batch,
+                        num_steps=solver_steps,
+                    )
                 target_latents.extend(predicted[index : index + 1] for index in range(batch_count))
 
         source_token_count: object | None = latent_row.get("token_count")
@@ -623,7 +798,9 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
         transition_progress.set_postfix(
             source=pending[0][1], target=f"batch({len(pending)})", stage="decode", refresh=True
         )
-        normalized_latents = [first_output.reconstructed_source_latent, *target_latents]
+        # Decode the cached factual latent directly as a pure VAE ceiling, in
+        # addition to the transport round-trip and edited endpoints.
+        normalized_latents = [latent, first_output.reconstructed_source_latent, *target_latents]
         decoded_midis: list[object] = []
         decode_batch_size = int(cfg.counterfactual.get("decode_batch_size", 8))
         for start in range(0, len(normalized_latents), decode_batch_size):
@@ -660,8 +837,10 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
             num_bars=int(str(source_record["num_bars"])),
         )
         tokenizer.decode(source_tokens).dump(str(first_dir / "source.mid"))
+        vae_reconstruction_path = first_dir / "vae_reconstruction.mid"
+        decoded_midis[0].dump(str(vae_reconstruction_path))  # type: ignore[attr-defined]
         reconstructed_path = first_dir / "same_style_reconstruction.mid"
-        decoded_midis[0].dump(str(reconstructed_path))  # type: ignore[attr-defined]
+        decoded_midis[1].dump(str(reconstructed_path))  # type: ignore[attr-defined]
         noise_path = first_dir / "abducted_noise.pt"
         torch.save(first_output.abducted_noise.cpu(), noise_path)
         noise_digest = hashlib.sha256(noise_path.read_bytes()).hexdigest()
@@ -682,10 +861,13 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 if (first_dir / "source.mid").exists():
                     _replace_with_link_or_copy(first_dir / "source.mid", sample_dir / "source.mid")
                 _replace_with_link_or_copy(
+                    vae_reconstruction_path, sample_dir / "vae_reconstruction.mid"
+                )
+                _replace_with_link_or_copy(
                     reconstructed_path, sample_dir / "same_style_reconstruction.mid"
                 )
                 _replace_with_link_or_copy(noise_path, sample_dir / "abducted_noise.pt")
-            decoded_midis[transition_index + 1].dump(  # type: ignore[attr-defined]
+            decoded_midis[transition_index + 2].dump(  # type: ignore[attr-defined]
                 str(sample_dir / "counterfactual.mid")
             )
             metadata = {
@@ -704,7 +886,11 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                 "classifier_free_guidance": bool(
                     cfg.transport.get("classifier_free_guidance", False)
                 ),
-                "guidance_scale": float(cfg.transport.get("guidance_scale", 1.0)),
+                "guidance_scale": prediction_guidance_scale,
+                "abduction_guidance_scale": abduction_guidance_scale,
+                "reconstruction_guidance_scale": reconstruction_guidance_scale,
+                "prediction_guidance_scale": prediction_guidance_scale,
+                "source_repulsion_scale": source_repulsion_scale,
                 "noise_sha256": noise_digest,
                 "latent_roundtrip": roundtrip,
                 **generation_identity,
@@ -747,6 +933,17 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
             if isinstance(path, str)
         ]
         artifact_root.mkdir(parents=True, exist_ok=True)
+        selected_rows = latent_dataset.frame.iloc[global_selected_indices]
+        source_count_ids = selected_rows[strata[0]].astype(int).value_counts().sort_index()
+        axis_labels = list(card[f"{intervention}_vocabulary"]) if factorial else labels
+        source_counts = {
+            str(axis_labels[int(style)]): int(count) for style, count in source_count_ids.items()
+        }
+        pair_counts: dict[str, int] = {}
+        for index, target in proportional_targets.items():
+            source = int(latent_dataset.frame.iloc[index][strata[0]])
+            pair = f"{axis_labels[source]}_to_{axis_labels[target]}"
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
         (artifact_root / "generation_manifest.json").write_text(
             json.dumps(
                 {
@@ -754,6 +951,13 @@ def _generate(cfg: DictConfig, context: DistributedContext) -> None:
                     "world_size": context.world_size,
                     "selected_sources": len(global_selected_indices),
                     "planned_transitions": global_transition_total,
+                    "source_sampling_policy": str(source_sampling_policy),
+                    "target_policy": target_policy,
+                    "sampling_population": "unique_sources"
+                    if bool(cfg.counterfactual.get("unique_sources", True))
+                    else "latent_segments",
+                    "source_style_counts": source_counts,
+                    "transition_pair_counts": dict(sorted(pair_counts.items())),
                     **generation_identity,
                     "metadata_files": sorted(set(all_metadata)),
                 },

@@ -19,6 +19,7 @@ CONFIGS = Path(__file__).parents[1] / "configs"
         "e22_cfm_exoreg",
         "e23_otcfm_exoreg",
         "e24_cfm_cfg_roundtrip",
+        "e25_otcfm_segment_cfg",
         "e30_xmidi_factorial",
         "e40_split_cfm",
         "e50_independent_flows",

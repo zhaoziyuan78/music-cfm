@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -77,6 +78,9 @@ def main(cfg: DictConfig) -> None:
     clamp_cfg = cfg.evaluation.clamp2
     clamp_embeddings: dict[str, np.ndarray] = {}
     style_embeddings: list[np.ndarray] = []
+    style_logit_bias: list[float] | None = None
+    source_clamp_keys: list[str | None] = [None] * len(records)
+    vae_clamp_keys: list[str | None] = [None] * len(records)
     if bool(clamp_cfg.enabled):
         card = json.loads(
             (paths["processed_dir"] / data_name / "dataset_card.json").read_text(encoding="utf-8")
@@ -99,10 +103,40 @@ def main(cfg: DictConfig) -> None:
             generated = metadata_path.parent / "counterfactual.mid"
             if validate_midi(generated).valid:
                 midi_files[f"generated-{index:08d}"] = generated
-        template = str(clamp_cfg.style_template)
+            source = metadata_path.parent / "source.mid"
+            if validate_midi(source).valid:
+                source_key = (
+                    "source-"
+                    + hashlib.sha256(str(_metadata["segment_id"]).encode()).hexdigest()[:16]
+                )
+                midi_files.setdefault(source_key, source)
+                source_clamp_keys[index] = source_key
+            vae_reconstruction = metadata_path.parent / "vae_reconstruction.mid"
+            if vae_reconstruction.is_file() and validate_midi(vae_reconstruction).valid:
+                vae_key = (
+                    "vae-reconstruction-"
+                    + hashlib.sha256(str(_metadata["segment_id"]).encode()).hexdigest()[:16]
+                )
+                midi_files.setdefault(vae_key, vae_reconstruction)
+                vae_clamp_keys[index] = vae_key
+        relabel_config_value = clamp_cfg.get("relabel_config")
+        if relabel_config_value is not None:
+            relabel_config_path = Path(str(relabel_config_value)).expanduser().resolve()
+            relabel_config = json.loads(relabel_config_path.read_text(encoding="utf-8"))
+            templates = [str(value) for value in relabel_config["prompt_templates"]]
+            bias_mapping = relabel_config["prompt_logit_bias"]
+            style_logit_bias = [float(bias_mapping[label]) for label in style_labels]
+        else:
+            configured_templates = clamp_cfg.get("style_templates")
+            templates = (
+                [str(value) for value in configured_templates]
+                if configured_templates is not None
+                else [str(clamp_cfg.style_template)]
+            )
         prompts = {
-            f"style-{index:04d}": style_prompt(label, template)
-            for index, label in enumerate(style_labels)
+            f"style-{style_id:04d}-{template_id:02d}": style_prompt(label, template)
+            for style_id, label in enumerate(style_labels)
+            for template_id, template in enumerate(templates)
         }
         clamp_embeddings = extract_clamp2_embeddings(
             repository=Path(str(clamp_cfg.repository)).expanduser().resolve(),
@@ -115,9 +149,16 @@ def main(cfg: DictConfig) -> None:
             ),
             cache_dir=Path(str(clamp_cfg.cache_dir)).expanduser().resolve(),
         )
-        style_embeddings = [
-            clamp_embeddings[f"style-{index:04d}"] for index in range(len(style_labels))
-        ]
+        style_embeddings = []
+        for style_id in range(len(style_labels)):
+            embedding = np.stack(
+                [
+                    clamp_embeddings[f"style-{style_id:04d}-{template_id:02d}"]
+                    for template_id in range(len(templates))
+                ]
+            ).mean(axis=0)
+            embedding /= np.linalg.norm(embedding)
+            style_embeddings.append(embedding)
     rows: list[dict[str, object]] = []
     noise_by_sample: dict[str, tuple[torch.Tensor, int]] = {}
     invalid_generated_midis = 0
@@ -148,8 +189,40 @@ def main(cfg: DictConfig) -> None:
                     style_embeddings=style_embeddings,
                     source_style_id=int(metadata["source_style_id"]),
                     target_style_id=int(metadata["target_style_id"]),
+                    logit_bias=style_logit_bias,
                 )
             )
+        source_embedding_key = source_clamp_keys[artifact_index]
+        vae_embedding_key = vae_clamp_keys[artifact_index]
+        source_style_id = int(metadata["source_style_id"])
+        if source_embedding_key is not None and source_embedding_key in clamp_embeddings:
+            source_style_metrics = clamp2_style_metrics(
+                clamp_embeddings[source_embedding_key],
+                style_embeddings=style_embeddings,
+                source_style_id=source_style_id,
+                target_style_id=source_style_id,
+                logit_bias=style_logit_bias,
+            )
+            metrics["clamp2_source_pseudolabel_success"] = source_style_metrics[
+                "clamp2_target_style_success"
+            ]
+            metrics["clamp2_source_pseudolabel_similarity"] = source_style_metrics[
+                "clamp2_target_similarity"
+            ]
+        if vae_embedding_key is not None and vae_embedding_key in clamp_embeddings:
+            vae_style_metrics = clamp2_style_metrics(
+                clamp_embeddings[vae_embedding_key],
+                style_embeddings=style_embeddings,
+                source_style_id=source_style_id,
+                target_style_id=source_style_id,
+                logit_bias=style_logit_bias,
+            )
+            metrics["clamp2_vae_reconstruction_pseudolabel_retention"] = vae_style_metrics[
+                "clamp2_target_style_success"
+            ]
+            metrics["clamp2_vae_reconstruction_pseudolabel_similarity"] = vae_style_metrics[
+                "clamp2_target_similarity"
+            ]
         row: dict[str, object] = {**metadata, **metrics}
         rows.append(row)
         sample_id = str(metadata["sample_id"])

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import combinations
+
 import torch
 from torch import Tensor
 
@@ -59,3 +61,30 @@ def class_conditional_sliced_wasserstein(
         if int((labels == label).sum()) >= 2
     ]
     return torch.stack(losses).mean() if losses else generated.sum() * 0.0
+
+
+def cross_class_sliced_wasserstein(
+    features: Tensor,
+    labels: Tensor,
+    *,
+    num_projections: int = 32,
+    seed: int = 0,
+) -> Tensor:
+    """Mean pairwise SWD across observed classes, using equal-sized subsets."""
+
+    losses = []
+    for pair_index, (left, right) in enumerate(combinations(torch.unique(labels).tolist(), 2)):
+        left_values = features[labels == left]
+        right_values = features[labels == right]
+        count = min(len(left_values), len(right_values))
+        if count < 2:
+            continue
+        losses.append(
+            sliced_wasserstein_distance(
+                left_values[:count],
+                right_values[:count],
+                num_projections=num_projections,
+                seed=seed + pair_index,
+            )
+        )
+    return torch.stack(losses).mean() if losses else features.sum() * 0.0

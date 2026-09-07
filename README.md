@@ -254,18 +254,18 @@ abduction-fine-tuning stage. The relabeled latent cache remains unchanged and is
 `data.latent_index`:
 
 ```bash
-# One A100: unified CFM + round-trip + CFG
+# One A100: unified conditional OT-CFM (the overlay must already exist)
 CUDA_VISIBLE_DEVICES=0 uv run python -m cfmusic.commands.train_transport \
-  experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_prompt.parquet \
+  experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_segment_v2.parquet \
   paths.data_root=$CFMUSIC_DATA_ROOT
 
-# Four A100s: unified CFM + round-trip + CFG
+# Four A100s: recommended
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
-  -m cfmusic.commands.train_transport experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_prompt.parquet \
+  -m cfmusic.commands.train_transport experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_segment_v2.parquet \
   paths.data_root=$CFMUSIC_DATA_ROOT
 
 # Conditional DDIM uses the same launcher; choose e10_ddim_vanilla or e11_ddim_fpi
@@ -276,22 +276,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
   paths.data_root=$CFMUSIC_DATA_ROOT
 ```
 
-The XMIDI CFM backbone is a 768-wide, 10-layer AdaLN DiT. Every optimizer step uses the ordinary
-independent conditional-flow-matching loss. After 5,000 warm-up steps, a source-latent round-trip
-loss ramps linearly to weight 0.25 over the next 5,000 steps. To bound memory and runtime on an
-A100 40G, this auxiliary path runs every fourth optimizer step on 16 examples per GPU with a
-two-step Heun inverse and forward solve; the main CFM batch remains 512 per GPU. The round-trip
-term combines latent L1 error and cosine distance.
+The XMIDI CFM backbone remains a 768-wide, 10-layer AdaLN DiT, so the existing `64 x 512` VAE
+latents are consumed unchanged. Training uses within-style Hungarian minibatch OT in a fixed
+128-dimensional projection and samples time from `0.5 U(0,1) + 0.5 Beta(0.5,1)`. Each per-GPU
+batch has 64 unique songs from each of the six pseudo-genres (384 total); rows are ordered by shard
+for mmap throughput, and prompt-margin confidence weights enter the per-sample CFM loss.
 
-Classifier-free guidance is trained with 10% per-example condition dropout. The null branch keeps
-dataset and task embeddings but removes style/genre/emotion embeddings. Inference uses scale 1.5:
-`v_cfg = v_null + 1.5 * (v_cond - v_null)`. The exact same guided vector field is used from data to
-noise during abduction and from noise to data during both same-style reconstruction and target-style
-prediction. Conditional and null branches are concatenated into one model call per ODE evaluation.
+Classifier-free guidance is trained with 10% per-example condition dropout. Source abduction and
+same-style reconstruction are fixed at guidance 1.0. Target prediction defaults to
+`v_null + 2(v_target-v_null) - 0.5(v_source-v_null)`; all required branches are concatenated into
+one vector-field call. The prediction and source-repulsion scales are inference-only and may be
+changed without invalidating a checkpoint.
 
-HSIC, prior matching, cross-class MMD, sliced-Wasserstein, and adversarial noise constraints are not
-part of this training objective. Noise probes remain in evaluation only, so they diagnose leakage
-without contributing gradients. The class-balanced CFM loss remains enabled for relabeled XMIDI.
+After a 5,000-step warm-up and 5,000-step ramp, three differentiable auxiliaries run on different
+offsets of an eight-step cycle: round trip at weight 0.05 (16 examples/GPU), conditional endpoint
+MMD+SWD at weight 0.05 (4 examples/style/GPU), and lightweight projected exogeneity losses
+(HSIC, cross-class MMD/SWD, and Gaussian-prior SWD; 4 examples/style/GPU). Every auxiliary uses an
+unguided four-step solve. Staggering them prevents their autograd graphs from sharing one memory
+peak with the full 384-example CFM path.
 
 All condition construction now goes through schema `task-aware-v2`. A genre run activates
 `dataset + task + style=genre` and sets `genre_id=emotion_id=None`; an emotion run similarly puts
@@ -301,7 +303,7 @@ The schema, task, and CFG training settings are checkpoint metadata. Resume requ
 and condition-dropout settings, while generation refuses to enable guidance for a checkpoint that
 was never trained with a null-condition branch. The guidance scale itself can be varied at inference.
 The unified checkpoint is written to
-`checkpoints/e34_cfm_clamp2_prompt_cfg_roundtrip/transport/last.pt`.
+`checkpoints/e35_otcfm_segment_cfg/transport/last.pt`.
 
 The full XMIDI continuation can be submitted with one Slurm command:
 
@@ -312,8 +314,9 @@ sbatch cfm.sh
 sbatch --export=ALL,CFMUSIC_SKIP_RELABEL=true,CFMUSIC_CFM_RESUME=true cfm.sh
 ```
 
-The unified objective does not alter the VAE, tokenizer, normalization, or latent-cache schema, so
-the current XMIDI VAE and CLaMP2-prompt latent index are reused directly. Start the new experiment
+The pipeline does not alter the VAE, tokenizer, normalization, or cached latent tensors. Its
+segment relabel step writes a lightweight index containing only new labels, confidence, and the
+existing shard/offset references. Start the new experiment
 with `CFMUSIC_CFM_RESUME=false`; set it to `true` only after this recipe has written its own
 `transport/last.pt`. Earlier non-CFG transport checkpoints cannot be resumed as CFG checkpoints.
 
@@ -327,9 +330,9 @@ For example:
 ```bash
 # Continue the unified CFM run; this works with either launcher above
 CUDA_VISIBLE_DEVICES=0 uv run python -m cfmusic.commands.train_transport \
-  experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_prompt.parquet \
+  experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_segment_v2.parquet \
   resume=true paths.data_root=$CFMUSIC_DATA_ROOT
 
 # Change the rolling interval if desired
@@ -342,17 +345,13 @@ Only rank zero writes progress, metrics, and checkpoints. Switching between one 
 resume preserves the optimizer step and safely resets only the within-epoch data cursor. The
 default profiles target a 40 GiB A100. The long-sequence pitched codec retains activation
 checkpointing and peaks near 30 GiB at batch 32. The CFM base path processes 512 samples per GPU;
-the differentiable round-trip graph is deliberately limited to 16 samples per GPU and only one in
-four optimizer steps. CFG doubles vector-field evaluations during those small round-trip solves and
-during inference, but not during the full-batch CFM loss. AdamW uses its fused CUDA implementation,
-and EMA is updated in equivalent ten-step chunks. With four GPUs, the global effective main-loss
-batch is the configured per-GPU batch times four (and times gradient accumulation).
+the E25 production recipe uses 384 samples per GPU and restricts differentiable solves to the small
+sparse subsets described above. CFG is not used by those training solves and does not duplicate the
+full-batch CFM forward. AdamW uses its fused CUDA implementation, and EMA is updated in equivalent
+ten-step chunks. With four GPUs, the main-loss global batch is 1,536.
 
-The production-size smoke test on an A100 40G measured a 22.92 GiB peak including AdamW, EMA,
-the 512-example CFM path, and the differentiable guided round trip. After optimizer warm-up, an
-ordinary CFM step took 0.82 seconds and a round-trip step took 4.57 seconds. At the configured
-one-in-four schedule this is 1.76 seconds per optimizer step on one GPU, corresponding to roughly
-1,166 samples/second for the four-GPU main batch before DDP and input-pipeline overhead. Re-run
+The earlier 512-example CFM plus guided-round-trip smoke test peaked at 22.92 GiB on an A100 40G;
+E25 lowers the main batch and staggers the additional objectives to retain headroom. Re-run
 `scripts/memory_smoke.py --cases unified_cfm_train --limit-gib 38` after changing the model,
 batch, solver, or guidance settings.
 
@@ -380,14 +379,13 @@ history and curve. For example, inspect the unified CFM run with:
 
 ```bash
 uv run tensorboard --logdir \
-  /l/users/gus.xia/ziyuan/music-scm/checkpoints/e34_cfm_clamp2_prompt_cfg_roundtrip/transport/tensorboard
+  /l/users/gus.xia/ziyuan/music-scm/checkpoints/e35_otcfm_segment_cfg/transport/tensorboard
 ```
 
-Latent transport loaders retain locality by visiting only one or two contiguous shards per batch.
-Within that locality, the unified trainer weights songs equally and selects a changing segment from
-each song. Its budget is capped at 60 data passes, 50k optimizer steps, and a 5k-step floor. The
-auxiliary round trip uses the configured two-step training solve; final generation uses the
-configured 32-step solve with CFG for both directions.
+Latent transport loaders assign stable shard sets to ranks and keep each batch style-balanced and
+song-unique. Training is capped at 50k optimizer steps. Sparse auxiliary solves use four Heun
+steps; final generation uses 32 steps, guidance 1 for abduction/reconstruction, and configurable
+target/source-repulsive guidance only for prediction.
 
 Latent caching has its own inference batch size, and all inference paths use inference mode plus
 bf16 where numerically safe. Length bucketing avoids padding every codec batch to its maximum token
@@ -426,8 +424,10 @@ export CLAMP2_CACHE_DIR=/l/users/gus.xia/ziyuan/music-scm/checkpoints/clamp2/hug
 
 Evaluation converts each generated MIDI to CLaMP 2's lossless MTF input, extracts normalized MIDI
 and style-text embeddings once, and reports target similarity, source similarity, their margin,
-and zero-shot target success. The prompt is configurable through
-`evaluation.clamp2.style_template`.
+and zero-shot target success. The new overlay selects one real cached 8-bar segment per song,
+averages eight genre-prompt templates, calibrates six logit biases on validation labels, and keeps
+the top 60% margin within every training pseudo-class. Evaluation reads the same prompt ensemble
+and calibration from the relabel configuration.
 
 The evaluation launched by `cfm.sh` fixes `task=genre`, so CLaMP 2 compares only the XMIDI style
 (genre) labels and does not treat emotion or another auxiliary label as an intervention. The
@@ -437,33 +437,34 @@ Generate and evaluate unpaired counterfactuals:
 
 ```bash
 uv run python -m cfmusic.commands.generate_counterfactuals \
-  experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_prompt.parquet \
-  transport_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e34_cfm_clamp2_prompt_cfg_roundtrip/transport/last.pt \
+  experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_segment_v2.parquet \
+  transport_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e35_otcfm_segment_cfg/transport/last.pt \
   codec_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e00_xmidi_codec/codec/xmidi/last.pt \
   counterfactual.target_policy=all_other
 
 # Four A100s: split the selected sources across four independent generation workers
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --standalone --nproc_per_node=4 \
-  -m cfmusic.commands.generate_counterfactuals experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_prompt.parquet \
-  transport_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e34_cfm_clamp2_prompt_cfg_roundtrip/transport/last.pt \
+  -m cfmusic.commands.generate_counterfactuals experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  data.latent_index=$CFMUSIC_DATA_ROOT/latents/xmidi/index_clamp2_segment_v2.parquet \
+  transport_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e35_otcfm_segment_cfg/transport/last.pt \
   codec_checkpoint=$CFMUSIC_CHECKPOINTS_DIR/e00_xmidi_codec/codec/xmidi/last.pt \
   counterfactual.target_policy=all_other
 
-uv run python -m cfmusic.commands.evaluate experiment=e24_cfm_cfg_roundtrip \
-  experiment.name=e34_cfm_clamp2_prompt_cfg_roundtrip \
-  evaluation.clamp2.repository=$CLAMP2_REPOSITORY
+uv run python -m cfmusic.commands.evaluate experiment=e25_otcfm_segment_cfg \
+  experiment.name=e35_otcfm_segment_cfg \
+  evaluation.clamp2.repository=$CLAMP2_REPOSITORY \
+  evaluation.clamp2.relabel_config=$CFMUSIC_ARTIFACTS_DIR/diagnostics/clamp2_xmidi_segment_relabel_v2/relabel_config.json
 uv run python -m cfmusic.commands.build_report \
-  report.experiments='[e34_cfm_clamp2_prompt_cfg_roundtrip]'
+  report.experiments='[e35_otcfm_segment_cfg]'
 ```
 
 Generation now selects at most 10 unique songs per source style (60 sources / 300 ordered
 transitions for six-style XMIDI) with vectorized grouping, and reads only those rows from the large
-MIDI manifest. Each source is inverted and reconstructed once, all target conditions are
-transported with CFG and decoded in GPU batches, and codec decoding uses projected self/cross-attention K/V
+MIDI manifest. Each source is inverted and reconstructed once without CFG, all target conditions
+are transported with target CFG plus source repulsion and decoded in GPU batches, and codec decoding uses projected self/cross-attention K/V
 caches. In four-GPU jobs, only rank zero hashes the large codec checkpoint. A worst-case A100 test
 decoded six full 2560-token sequences in 22.7 seconds at 1.32 GiB allocated memory; ordinary runs
 can finish sooner at EOS. Completed artifacts are skipped on reruns. Override
@@ -477,7 +478,7 @@ It never requires a paired target MIDI.
 
 ## Experiment matrix
 
-The active XMIDI method is E24, the single-stage CFM + round-trip + CFG recipe. E00 is the codec
+The active XMIDI method is E25, the single-stage balanced conditional OT-CFM recipe. E00 is the codec
 ceiling; E10/E11 are DDIM ablations; and the older E20–E23 two-stage configurations are retained
 only for reproducing prior results. E30 is XMIDI factorial; E31 EMOPIA; E32 VGMIDI; E33 Groove;
 E40 the weak conserved/editable split; E50 independent per-style flows; E51 shuffled labels; and

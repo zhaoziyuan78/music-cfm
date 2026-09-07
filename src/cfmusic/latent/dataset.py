@@ -46,12 +46,8 @@ class LatentDataset(Dataset[dict[str, torch.Tensor | str | int]]):
                 raise TypeError(f"Invalid latent label-overlay metadata: {overlay_path}")
             if overlay.get("schema_version") != "cfmusic.latent-label-overlay.v1":
                 raise ValueError(f"Unsupported latent label-overlay schema: {overlay_path}")
-            if overlay.get("base_dataset_manifest_hash") != metadata.get(
-                "dataset_manifest_hash"
-            ):
-                raise ValueError(
-                    "Latent label overlay was built for a different base latent cache"
-                )
+            if overlay.get("base_dataset_manifest_hash") != metadata.get("dataset_manifest_hash"):
+                raise ValueError("Latent label overlay was built for a different base latent cache")
             if int(overlay.get("rows", -1)) != len(frame):
                 raise ValueError("Latent label-overlay row count does not match its sidecar")
             assignment_hash = overlay.get("label_assignment_hash")
@@ -73,9 +69,7 @@ class LatentDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             }
             if mismatches:
                 raise ValueError(f"Latent cache provenance mismatch: {mismatches}")
-        self.metadata: dict[str, object] = {
-            str(key): value for key, value in metadata.items()
-        }
+        self.metadata: dict[str, object] = {str(key): value for key, value in metadata.items()}
         self.frame = frame.loc[frame["split"] == split].reset_index(drop=True)
         self.normalize = normalize
         self.statistics: LatentStatistics = load_statistics(root)
@@ -95,6 +89,11 @@ class LatentDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         self._genre_ids = self.frame["genre_id"].tolist() if "genre_id" in self.frame else None
         self._emotion_ids = (
             self.frame["emotion_id"].tolist() if "emotion_id" in self.frame else None
+        )
+        self._sample_weights = (
+            self.frame["label_confidence_weight"].astype(float).tolist()
+            if "label_confidence_weight" in self.frame
+            else None
         )
 
     def _load_shard(self, shard_name: str) -> dict[str, object]:
@@ -136,4 +135,6 @@ class LatentDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             item["genre_id"] = int(self._genre_ids[index])
         if self._emotion_ids is not None and pd.notna(self._emotion_ids[index]):
             item["emotion_id"] = int(self._emotion_ids[index])
+        if self._sample_weights is not None:
+            item["sample_weight"] = torch.tensor(self._sample_weights[index], dtype=torch.float32)
         return item

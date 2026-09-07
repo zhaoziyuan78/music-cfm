@@ -1,5 +1,6 @@
 from cfmusic.data.samplers import (
     BalancedStyleBatchSampler,
+    BalancedStyleShardBatchSampler,
     DatasetTemperatureLengthBatchSampler,
     DistributedBatchSampler,
     GroupedLengthBatchSampler,
@@ -42,7 +43,9 @@ def test_grouped_length_sampler_preserves_source_locality_and_reduces_padding() 
         positions: dict[str, list[int]] = {}
         for position, index in enumerate(batch):
             positions.setdefault(groups[index], []).append(position)
-        assert all(values == list(range(values[0], values[-1] + 1)) for values in positions.values())
+        assert all(
+            values == list(range(values[0], values[-1] + 1)) for values in positions.values()
+        )
     assert sampler.estimated_attention_efficiency > 0.8
 
 
@@ -179,3 +182,42 @@ def test_balanced_style_sampler_selects_unique_songs_per_class() -> None:
         for label in {labels[index] for index in batch}:
             selected_groups = {groups[index] for index in batch if labels[index] == label}
             assert len(selected_groups) == 3
+
+
+def test_balanced_style_shard_sampler_is_rank_local_balanced_and_song_unique() -> None:
+    labels: list[int] = []
+    shards: list[str] = []
+    groups: list[str] = []
+    for shard in ("a", "b", "c", "d"):
+        for label in range(2):
+            for song in range(3):
+                labels.append(label)
+                shards.append(shard)
+                groups.append(f"{shard}-style-{label}-song-{song}")
+    ranks = [
+        BalancedStyleShardBatchSampler(
+            labels,
+            shards,
+            groups,
+            classes_per_batch=2,
+            samples_per_class=2,
+            rank=rank,
+            world_size=2,
+            seed=9,
+        )
+        for rank in range(2)
+    ]
+
+    assert len(ranks[0]) == len(ranks[1])
+    for rank, sampler in enumerate(ranks):
+        allowed_shards = {"a", "c"} if rank == 0 else {"b", "d"}
+        for batch in sampler:
+            assert len(batch) == 4
+            assert {shards[index] for index in batch}.issubset(allowed_shards)
+            assert len({groups[index] for index in batch}) == 4
+            assert {
+                label: sum(labels[index] == label for index in batch) for label in range(2)
+            } == {
+                0: 2,
+                1: 2,
+            }

@@ -36,31 +36,18 @@ def validate_guidance_checkpoint(
         if isinstance(saved_config, Mapping)
         else 0.0
     )
-    saved_scale = (
-        float(saved_config.get("guidance_scale", 1.0))
-        if isinstance(saved_config, Mapping)
-        else 1.0
-    )
     requested_dropout = float(cfg.get("condition_dropout", 0.0))
-    requested_scale = float(cfg.get("guidance_scale", 1.0))
     if requested and (not saved or saved_dropout <= 0):
         raise ValueError(
             "Classifier-free guidance requires a checkpoint trained with positive condition "
             "dropout; disable CFG for this checkpoint or train the unified CFG recipe"
         )
     if exact_training_match and (
-        requested != saved
-        or (
-            requested
-            and (
-                abs(requested_dropout - saved_dropout) > 1e-12
-                or abs(requested_scale - saved_scale) > 1e-12
-            )
-        )
+        requested != saved or (requested and abs(requested_dropout - saved_dropout) > 1e-12)
     ):
         raise ValueError(
-            "Cannot resume with different classifier-free-guidance, condition-dropout, or "
-            "guidance-scale settings"
+            "Cannot resume with different classifier-free-guidance or condition-dropout "
+            "training settings; inference guidance scales may be changed safely"
         )
 
 
@@ -102,6 +89,7 @@ def create_transport(
             fpi_stop_on_convergence=bool(cfg.ddim_inversion.stop_on_convergence),
         )
     ot_cfg = cfg.flow.get("ot")
+    legacy_guidance_scale = float(cfg.get("guidance_scale", 1.0))
     flow = ConditionalFlow(
         backbone,
         solver_method=str(cfg.solver.method),
@@ -111,7 +99,15 @@ def create_transport(
         ot_regularization=float(ot_cfg.regularization) if ot_cfg else 0.05,
         classifier_free_guidance=bool(cfg.get("classifier_free_guidance", False)),
         condition_dropout=float(cfg.get("condition_dropout", 0.0)),
-        guidance_scale=float(cfg.get("guidance_scale", 1.0)),
+        guidance_scale=legacy_guidance_scale,
+        abduction_guidance_scale=float(cfg.get("abduction_guidance_scale", legacy_guidance_scale)),
+        reconstruction_guidance_scale=float(
+            cfg.get("reconstruction_guidance_scale", legacy_guidance_scale)
+        ),
+        prediction_guidance_scale=float(
+            cfg.get("prediction_guidance_scale", legacy_guidance_scale)
+        ),
+        source_repulsion_scale=float(cfg.get("source_repulsion_scale", 0.0)),
     )
     if bool(cfg.get("independent_per_style", False)):
         return IndependentStyleFlows(flow, int(cfg.conditioning.num_styles))

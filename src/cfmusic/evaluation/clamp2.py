@@ -133,17 +133,29 @@ def clamp2_style_metrics(
     style_embeddings: Sequence[np.ndarray],
     source_style_id: int,
     target_style_id: int,
+    logit_bias: Sequence[float] | None = None,
 ) -> dict[str, float]:
     similarities = np.asarray(
         [float(music_embedding @ style_embedding) for style_embedding in style_embeddings]
     )
     if target_style_id >= len(similarities) or source_style_id >= len(similarities):
         raise ValueError("Artifact style id is outside the CLaMP 2 text vocabulary")
-    return {
+    decision_scores = similarities
+    if logit_bias is not None:
+        bias = np.asarray(logit_bias, dtype=np.float64)
+        if bias.shape != similarities.shape or not np.isfinite(bias).all():
+            raise ValueError("CLaMP 2 logit bias must contain one finite value per style")
+        decision_scores = similarities + bias
+    metrics = {
         "clamp2_target_similarity": float(similarities[target_style_id]),
         "clamp2_source_similarity": float(similarities[source_style_id]),
         "clamp2_target_minus_source": float(
             similarities[target_style_id] - similarities[source_style_id]
         ),
-        "clamp2_target_style_success": float(int(similarities.argmax()) == target_style_id),
+        "clamp2_target_style_success": float(int(decision_scores.argmax()) == target_style_id),
     }
+    if logit_bias is not None:
+        metrics["clamp2_calibrated_target_minus_source"] = float(
+            decision_scores[target_style_id] - decision_scores[source_style_id]
+        )
+    return metrics

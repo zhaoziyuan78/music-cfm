@@ -47,6 +47,7 @@ latent_cache:
 counterfactual:
   # Select explicitly after comparing raw/EMA validation metrics.
   transport_weights: raw
+  source_sampling_policy: balanced
   target_policy: all_other
   explicit_pairs: []
   # Ten unique songs per source style and five targets produce at most 300
@@ -69,6 +70,8 @@ evaluation:
     python_executable: null
     cache_dir: ${oc.env:CLAMP2_CACHE_DIR,${paths.checkpoints_dir}/clamp2/huggingface}
     style_template: "This is a piece of {style} music."
+    style_templates: null
+    relabel_config: null
 report:
   experiments: []
 license:

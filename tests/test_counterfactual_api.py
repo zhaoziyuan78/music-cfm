@@ -8,6 +8,8 @@ from torch import nn
 from cfmusic.commands.generate_counterfactuals import (
     _artifact_matches_generation,
     concatenate_conditions,
+    largest_remainder_quotas,
+    proportional_target_assignments,
     select_source_indices,
 )
 from cfmusic.conditioning.schema import ConditionBatch
@@ -56,6 +58,60 @@ def test_source_selection_is_balanced_unique_and_deterministic() -> None:
     assert selected_frame["style_id"].value_counts().to_dict() == {0: 2, 1: 2}
 
 
+def test_source_selection_can_follow_empirical_proportions_exactly() -> None:
+    frame = pd.DataFrame(
+        {
+            "sample_id": [f"sample-{index}" for index in range(100)],
+            "style_id": [0] * 40 + [1] * 30 + [2] * 20 + [3] * 10,
+        }
+    )
+
+    selected = select_source_indices(
+        frame,
+        strata=["style_id"],
+        max_per_stratum=100,
+        max_total=30,
+        unique_sources=True,
+        seed=11,
+        policy="proportional",
+    )
+
+    assert frame.iloc[selected]["style_id"].value_counts().to_dict() == {
+        0: 12,
+        1: 9,
+        2: 6,
+        3: 3,
+    }
+
+
+def test_proportional_targets_exclude_source_and_use_exact_quotas() -> None:
+    frame = pd.DataFrame(
+        {
+            "sample_id": [f"sample-{index}" for index in range(10)],
+            "style_id": [0] * 4 + [1] * 3 + [2] * 2 + [3],
+        }
+    )
+    selected = list(range(4))
+
+    assignments = proportional_target_assignments(
+        frame,
+        selected,
+        stratum="style_id",
+        unique_sources=True,
+        seed=5,
+    )
+
+    assert set(assignments) == set(selected)
+    assert all(frame.iloc[index]["style_id"] != target for index, target in assignments.items())
+    assert pd.Series(assignments).value_counts().to_dict() == {1: 2, 2: 1, 3: 1}
+
+
+def test_largest_remainder_quota_respects_capacity() -> None:
+    assert largest_remainder_quotas(
+        {"large": 9, "small": 1}, total=5, capacity={"large": 3, "small": 2}
+    ) == {"large": 3, "small": 2}
+
+
 def test_condition_concatenation_preserves_factorial_fields() -> None:
     first = ConditionBatch(
         torch.tensor([0]),
@@ -87,9 +143,7 @@ def test_existing_artifact_must_match_current_generation_identity(tmp_path: Path
         "transport_checkpoint_hash": "transport-new",
         "generation_config_hash": "config-new",
     }
-    metadata_path.write_text(
-        json.dumps({**identity, "sample_id": "example"}), encoding="utf-8"
-    )
+    metadata_path.write_text(json.dumps({**identity, "sample_id": "example"}), encoding="utf-8")
 
     assert _artifact_matches_generation(metadata_path, identity)
     assert not _artifact_matches_generation(

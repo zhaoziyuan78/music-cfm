@@ -1,271 +1,217 @@
-下面是结合代码和 `summary.md` 实验结果后的修改意见。
+## 2. 最优先修正：不要在 source abduction 中使用 CFG
 
-## 最重要的发现：condition 训练与生成不一致
+当前 [`ConditionalFlow`](src/cfmusic/transport/conditional_flow.py) 的一个全局 `guidance_scale` 同时作用于：
 
-这是当前最优先修复的问题，很可能比“HSIC 权重不够”更能解释反事实风格失败。
+1. source latent 的反演；
+2. source reconstruction；
+3. target prediction。
 
-XMIDI adapter 无论训练 genre 还是 factorial，都保存了 `style`、`genre`、`emotion` 三个标签：[xmidi.py](src/cfmusic/data/adapters/xmidi.py)。
-
-在非 factorial 的 genre 训练中，[conditions_from_batch](src/cfmusic/training/transport_trainer.py) 实际构造的是：
-
-$$
-c_{\text{train}}
-=
-e_{\text{style}}(\text{genre})
-+
-e_{\text{genre}}(\text{genre})
-+
-e_{\text{emotion}}(\text{emotion}),
-$$
-
-因为它虽然把 `style_id` 设成 genre，却仍然把 batch 里的 `genre_id`、`emotion_id` 传给 condition embedding。
-
-但 [generate_counterfactuals.py](src/cfmusic/commands/generate_counterfactuals.py) 构造 source/target condition 时只提供 `style_id`：
+也就是现在实际上做：
 
 $$
-c_{\text{generation}}
-=
-e_{\text{style}}(\text{genre}).
+u=\widetilde F^{-1}_{s,w=1.5}(z),\qquad
+z^{cf}=\widetilde F_{t,w=1.5}(u).
 $$
 
-也就是说，当前 E20/E22 生成是在模型没有训练过的 condition 组合上运行。
-
-更严重的是，非 factorial 的 `contrasting_conditions()` 只修改 `style_id`，却保留原来的 `genre_id` 和 `emotion_id`。wrong-condition 事实上变成：
+但 CFG 的 guided field 对应的是一个被 sharpen 的分布，而不再是原始 \(p(z\mid s)\)。[Guided Flows](https://arxiv.org/abs/2311.13443) 给出的形式是：
 
 $$
-e_{\text{style}}(\text{wrong genre})
-+
-e_{\text{genre}}(\text{correct genre})
-+
-e_{\text{emotion}}(\text{factual emotion}),
+\tilde v_s=(1-w)v_\emptyset+w v_s,
 $$
 
-这是自相矛盾的 condition。因此 summary 中 100% condition accuracy 不能证明模型真正遵循 genre condition。
-
-### 必须修改
-
-建立唯一的 task-aware condition builder，训练、验证、生成和评价全部调用它：
-
-```text
-genre task:
-    dataset + task + style=genre
-    genre=None
-    emotion=None
-
-emotion task:
-    dataset + task + style=emotion
-    genre=None
-    emotion=None
-
-factorial task:
-    dataset + task + style=constant/sentinel
-    genre=genre_id
-    emotion=emotion_id
-```
-
-同时：
-
-* non-factorial 的 inactive condition 必须严格为 `None`；
-* factorial 不再重复加入 `style=genre`；
-* wrong condition 只修改当前激活的轴；
-* checkpoint 保存 `condition_schema_version`；
-* generation 检查 checkpoint schema，拒绝静默加载旧语义 checkpoint；
-* 修复后 E20/E22 需要重新训练，旧 checkpoint 不能作为干净的 genre-only 主结果。
-
-## 在重训前，先对现有 checkpoint 做一次定位实验
-
-现有模型仍可用于判断 condition mismatch 是否为主要原因。建议做一个 \(2\times2\) 检查：
-
-| 条件                      | 权重        |
-| ----------------------- | --------- |
-| 目前 style-only condition | raw model |
-| 目前 style-only condition | EMA       |
-| 训练时完整 condition         | raw model |
-| 训练时完整 condition         | EMA       |
-
-“完整 condition”具体是：
-
-* abduction：`style=source genre, genre=source genre, emotion=source emotion`；
-* prediction：`style=target genre, genre=target genre, emotion=source emotion`。
-
-分别用 4/8/16/32-step Heun，比较：
-
-* latent 与 MIDI 层面的风格 NShift；
-* target KAD；
-* content ExcessDrift；
-* leakage；
-* round-trip。
-
-如果完整 condition 明显改善风格迁移，基本即可确认训练/生成 mismatch 是主因。注意：这只能作为诊断，不能把旧模型重新解释成规范的 factorial 模型。
-
-## Style 没有从 noise 中剥离的代码原因
-
-### 1. 32768 维 noise 只约束固定的 128 维投影
-
-[abduction_trainer.py](src/cfmusic/training/abduction_trainer.py) 对 \(64\times512=32768\) 维 noise 使用一个固定 `32768→128` projector，然后仅在这 128 维上计算 HSIC 和 prior matching。
-
-这留下了 32640 维的巨大无约束子空间。模型完全可以把 style 信息迁移到 projector 的零空间，而不明显增加训练 loss。
-
-建议改为多视图、每步重采样：
-
-* 2–4 个随机 Rademacher/orthogonal projections，每个 128–256 维；
-* token-wise mean/std 表征；
-* 随机 token×channel block；
-* 每步或每若干步重新采样投影；
-* validation 使用不同 seed、不同 projector。
-
-训练目标可改成：
+其终点分布近似满足：
 
 $$
-\mathcal L_{\text{exo}}
-=
-\lambda_h \operatorname{HSIC}(u,s)
-+
-\lambda_p \operatorname{SWD}(u,\mathcal N)
-+
-\lambda_c
-\sum_{a<b}\operatorname{MMD}(u_a,u_b).
+\tilde p_s\propto p^{1-w}p_s^w.
 $$
 
-不要直接把当前固定投影上的 HSIC 权重调大；模型仍可能绕过 projector，或者以牺牲 style control 的方式降低 HSIC。
+因此，用 \(w>1\) 反演来自普通 \(p(z\mid s)\) 的 factual sample，会使得到的 \(u\) 不再可靠地服从共享标准高斯，并可能保留 source style。这与当前 pop/country source stickiness 和剩余 leakage 是一致的。
 
-### 2. prior loss 只匹配均值和逐维方差
+应改成：
 
-当前 `classwise_prior_matching` 没有约束：
+$$
+u=F^{-1}_{s,w_{\rm abd}=1}(z),
+\qquad
+z^{cf}=\widetilde F_{t,w_{\rm pred}}(u),
+\quad w_{\rm pred}>1.
+$$
 
-* covariance；
-* higher-order structure；
-* multimodality；
-* 不同 style noise 分布之间的整体差异。
-
-建议用随机投影 SWD/MMD 补足，而均值/方差 loss 只作为稳定器。仓库已有 adversary/GRL 模块，但 Stage‑2 trainer 并没有真正连接 `adversarial_weight`；`configs/independence/adversarial.yaml` 目前属于无效配置。可以把 adversary 接入，但最终 leakage probe 必须重新训练、与训练 adversary 独立。
-
-### 3. DDP 下 independence loss 只看单卡 64 个样本
-
-每个 rank 只看到 4 个 style、每类 16 个样本，无法直接估计全局 6 类分布。应当：
-
-* differentiable all-gather projected noise 和 labels；
-* 在全局 batch 上计算 HSIC/SWD/MMD；
-* 或保证每个 rank 都覆盖所有 style。
-
-否则多卡训练降低的是局部相关性，不一定降低全局 style leakage。
-
-### 4. sampler 在一个 shard 内抽取大量相关 segment
-
-Stage‑2 把 `dataset.shard_ids` 作为 group。每个 style 在一次 batch 中先选一个 shard，再从该 shard 抽多个 segment。连续窗口可能来自同一首作品，使 independence regularizer 把作品身份和风格混在一起。
-
-改成分层采样：
-
-```text
-style → unique song/sample_id → one segment
-```
-
-每个 batch 中同一首歌至多一个窗口。Stage‑1 也建议使用 genre→song→segment 的层级采样，避免长曲因 segment 多而获得过高权重。
-
-## CFM 本身怎样训练得更好
-
-### 1. 先移除目前的 wrong-condition margin 主损失
-
-当前 condition contrast 对同一条 factual flow path 输入错误 style，并要求其 velocity error 更高。错误 style 下这条 path 并不是一个有效 conditional FM training pair，因此模型可能学到“识别矛盾 condition 的水印”，而不是目标分布的传输机制。
-
-主实验建议先设：
+具体修改 API：
 
 ```yaml
-condition_objective.weight: 0
+classifier_free_guidance: true
+condition_dropout: 0.1
+
+abduction_guidance_scale: 1.0
+reconstruction_guidance_scale: 1.0
+prediction_guidance_scale: 2.0
 ```
 
-改为用真正的 endpoint 指标验证条件有效性：
+在验证集扫描：
+
+```text
+prediction scale: 1.0, 1.5, 2.0, 3.0, 4.0
+abduction scale: 固定 1.0
+```
+
+这是最适合你当前取舍的改动：**提高 target guidance 只改变 \(u\rightarrow z^{cf}\)，不会改变已经得到的 abducted noise，因此能牺牲内容换风格，而不直接增加 noise leakage。**
+
+## 3. 现有重标注仍然有一层 mismatch
+
+[`relabel_xmidi_clamp2.py`](src/cfmusic/commands/relabel_xmidi_clamp2.py) 的流程是：
+
+1. 对 107,975 首完整 MIDI 计算 CLaMP2 embedding；
+2. 用单个文本模板的最近 prompt 硬分配标签；
+3. 把整首曲子的标签复制给它的所有短 segment。
+
+但 CFM 实际训练和生成的是短 segment，当前生成样本平均只有约 30 beats。完整乐曲的 CLaMP2 标签不保证对每个局部 segment 仍成立。因此数据和 evaluator 仍未真正对齐。
+
+而且代码虽然计算了 `nearest_prompt_margin`，却：
+
+* 没有过滤低 margin 歌曲；
+* 没有把置信度传入 latent index；
+* 没有 prompt ensemble；
+* 没有保证六个 pseudo-class 平衡。
+
+建议重新构造训练集：
+
+* 对实际 latent segment 做 CLaMP2 标注；
+* 或至少只保留“segment 与整曲标签一致”的窗口；
+* 每类分别保留 top 50%–70% margin 的高置信样本；
+* 按 unique song 平衡采样，而不是按 segment 平衡；
+* 使用 8–16 个 prompt template，平均文本 embedding；
+* 对每个 prompt 的 logit bias 做真实验证集校准；
+* traditional 若仍无法形成紧致簇，应考虑从六类主实验中删除或重新定义。
+
+尤其需要先补三个 ceiling：
+
+1. 原始训练 segment 对其 pseudo-label 的 CLaMP2 top-1；
+2. VAE reconstruction 的 pseudo-label retention；
+3. 真实 target segment 的 per-class CLaMP2 top-1。
+
+如果 traditional 的真实 segment ceiling 本身只有 20%，生成模型的 6% 就不能全部归因于 CFM。
+
+## 4. 不重训就可以做的第二个增强：source-repulsive guidance
+
+逐样本结果显示失败样本主要表现为 target similarity 不够，同时 source similarity 仍偏高。可以在 target forward 中使用三分支 guidance：
 
 $$
-F_s(\epsilon)\sim p(z\mid s).
+v_{\rm edit}
+=
+v_\emptyset
++\omega(v_t-v_\emptyset)
+-\rho(v_s-v_\emptyset).
 $$
 
-如果要增强条件控制，可在短程 differentiable generation 后，对每个 style 的生成 endpoint 与真实 style latent 计算 class-conditional MMD/SWD。它仍不需要 paired target。
+其中：
 
-### 2. 改进 latent normalization
+* \(\omega\) 拉向 target；
+* \(\rho\) 排斥 source；
+* abduction 仍固定使用 \(w=1\)。
 
-当前统计把 `[B,64,512]` reshape 成 `[-1,512]`，只学习一组共享的 512 维 mean/std。但 VAE 的 64 个 latent token 来自不同 learned queries，位置分布可能显著不同。
+推荐扫描：
 
-优先改为：
+```text
+ω: 1.5, 2.0, 3.0
+ρ: 0.0, 0.25, 0.5, 1.0
+```
+
+这比重复执行反事实更合适。仓库里的 [`diagnose_repeated_intervention.py`](scripts/diagnose_repeated_intervention.py) 已经明确记录：第二次干预可以强化 target signal，但新 abducted noise 更容易被 source label 分类，恰好违背你限制 leakage 的目标。
+
+## 5. 下一版 CFM 的训练方案
+
+当前 [`cfm.yaml`](configs/transport/cfm.yaml) 使用 independent coupling、uniform time，而 `condition_objective` 完全关闭。高维 independent CFM 中，模型容易依赖 \(z_t\) 本身预测 factual endpoint，而忽略 style condition，特别是在接近数据端的 \(t\) 上。
+
+建议下一版采用：
+
+### 数据与 batch
+
+```yaml
+sampling:
+  balance_by_style: true
+  unique_song_per_batch: true
+  confidence_weighted: true
+```
+
+不要只使用当前 `class_balance_exponent=0.5` 的 loss weighting；需要让每个 batch 真正包含平衡的 style 和不同歌曲。
+
+### Conditional OT-CFM
+
+仓库已经实现了按 style 分组的 Hungarian OT coupling：
+
+[`ot_coupling.py`](src/cfmusic/transport/ot_coupling.py)
+
+它保持高斯样本的一对一排列，可直接组合 CFG。Minibatch OT coupling 能降低训练方差并产生更直的 flow trajectory，[Multisample Flow Matching](https://arxiv.org/abs/2304.14772) 和 [OT-CFM](https://arxiv.org/abs/2302.00482) 都给出了相应依据。
+
+保持网络、batch 和训练预算不变，只改：
+
+```yaml
+flow:
+  path: ot
+  ot:
+    solver: hungarian
+    cost_projection_dim: 128
+```
+
+### 增强靠近 noise 端的条件学习
+
+实现混合 time sampling：
 
 $$
-\mu,\sigma\in\mathbb R^{64\times512},
+t\sim0.5\,U(0,1)+0.5\,\mathrm{Beta}(0.5,1).
 $$
 
-即每个 latent position 独立统计 mean/std，并更新 latent-normalization schema/hash。之后再消融：
+靠近 \(t=0\) 时，state 几乎没有 factual-style 信息，模型必须依靠 condition 区分类别。这比直接提高现有 wrong-condition margin 更干净。
 
-* per-token normalization；
-* per-token normalization + channel whitening；
-* 当前共享 normalization。
+### 加入真正的 endpoint matching
 
-summary 中只有约 46.9% flattened latent dimensions 活跃，也说明目标分布可能是较薄的低维流形。可以进一步比较：
-
-* deterministic posterior mean；
-* posterior sample；
-* posterior mean + 小幅 Gaussian jitter；
-* flow path 的 `sigma_min=0.01/0.03`。
-
-### 3. 修正 Stage‑2 EMA
-
-Stage‑2 trainer 内部直接使用默认 `EMA decay=0.9999`，没有暴露配置。12k step 后，EMA 对初始 Stage‑1 权重仍约保留：
+不要直接用 CLaMP2 反向训练，否则会造成 evaluator hacking。利用仓库已有的 MMD/SWD，在少量可微生成 endpoint 上训练：
 
 $$
-0.9999^{12000}\approx 30.1\%.
+\mathcal L_{\rm endpoint}
+=
+\sum_s
+\operatorname{SWD}\bigl(F_s(u),Z_s^{real}\bigr),
+\qquad u\sim\mathcal N(0,I).
 $$
-
-而完整正则到 step 2500 才进入稳定阶段。因此最终生成使用的 EMA 很可能没有充分反映 Stage‑2 改动。
 
 建议：
 
-* 把 Stage‑2 EMA decay 写入配置；
-* 比较 `0.999`、`0.9995`；
-* validation 同时评价 raw/EMA；
-* 按 style–content–leakage Pareto 选 checkpoint；
-* 不再无条件默认使用 EMA；
-* 记录每项 loss 对模型参数的 gradient norm 和 gradient cosine，避免 RT loss 压过 exogeneity loss。
-
-### 4. 公平训练 OT-CFM
-
-当前 `ot_cfm.yaml` 与基础 CFM 的 hidden size、层数、batch size、训练长度不同，因此 E20 vs E23 同时改变了模型容量、优化预算和 coupling，不能作为论文中的干净 ablation。
-
-OT-CFM 对比必须保持：
-
-```text
-同一网络
-同一 batch
-同一 optimizer
-同一训练步数
-同一 sampler
-同一 Stage-2
-只改变 Gaussian–factual latent coupling
+```yaml
+endpoint_matching:
+  enabled: true
+  interval: 8
+  solver_steps: 4
+  samples_per_style: 4
+  weight: [0.01, 0.05, 0.1]
 ```
 
-OT-CFM 的确可能产生更直的路径、降低低 NFE 误差，但它应排在 condition 修复和 normalization 之后。[Conditional Flow Matching / OT-CFM](https://arxiv.org/abs/2302.00482v2)。
+这里的 \(u\) 是独立采样的，所以只能通过 condition 产生 style，不会鼓励把 style 塞进 noise。
 
-另外，Sinkhorn 分支用 `argmax` 选配对可能重复选择同一个 noise，不一定保持 Gaussian 端的排列性质；正式使用前应改成 permutation-preserving rounding。当前 Hungarian 路径不受此问题影响。
+### 保留一阶段，但恢复轻量 exogeneity regularization
 
-## 评价代码
+不必恢复独立 Stage 2。把它变成统一训练中的稀疏正则：
 
-Evaluation方面不再训练Transformer分类器，这一分类器本身训练精度不足，且评估时对于新样本可能OOD，不能作为评估指标。主要判断反事实是否成功的指标改为利用CLaMP 2，将MIDI和Style Text映射到同一Embedding Space，比较相似度，确定音乐的风格。Style Text可以将原来的Style Label编入一个固定Template来操作，例如“This is a piece of rock music"。具体Template怎么写你可以参考其他类似工作的做法。
+$$
+L=L_{\rm CFM}
++\lambda_eL_{\rm endpoint}
++\lambda_xL_{\rm exo}
++\lambda_rL_{\rm RT}.
+$$
 
-第二，应当有pitch-class histogram cosine,melody contour或者其他类似指标来评价模型对风格以外的因素如旋律的保留程度。
+其中 \(L_{\rm exo}\) 每 8 step 执行一次、使用无 CFG 的 4-step abduction，并采用多个动态随机投影上的：
 
-第三，通过在noise上做probe判断风格和外生噪声的解耦程度。
+* HSIC；
+* cross-class SWD/MMD；
+* prior matching。
 
-第四，评估最后生成的MIDI质量的指标。
+当前 round-trip 权重 0.25 偏大，而且训练时只有 2-step guided inversion。建议消融：
 
-## 必须补的单元测试
+```text
+roundtrip weight: 0, 0.05, 0.25
+roundtrip steps: 4
+roundtrip guidance: 1.0
+```
 
-* train/generation 对同一 metadata 构造完全相同的 factual condition；
-* non-factorial 的 genre/emotion condition 必须为 `None`；
-* factorial intervention 每次只改变一个轴；
-* wrong condition 不产生 style/genre 相互矛盾；
-* 旧 `condition_schema_version` checkpoint 被拒绝；
-* balanced batch 中每类样本来自不同 `sample_id`；
-* 多卡 exogeneity loss 与单卡全 batch 结果一致；
-* dynamic projector 不同 step 的方向不同；
-* iid Gaussian leakage probe 接近 chance；
-* raw/EMA 都进入 validation；
-* Sinkhorn coupling 保持一对一 assignment。
+逐样本结果中 round-trip MSE 的中位数为 0.026，但 90% 分位达到 0.761、最大 3.665；它有明显长尾，却与 style success 没有强关系，所以不是当前提升迁移率的主杠杆。
 
-整体结论是：当前最该做的不是继续加大 HSIC，而是先修复 condition 语义。现有结果可以概括为“VAE 很强、CFM 拟合了条件分布，但反事实接口与训练条件不一致；Stage‑2 的固定低秩约束也允许 style 从未约束维度泄漏”。修复 condition 后再评价 E20，才能判断剩余问题究竟来自 CFM transport、latent geometry，还是外生性正则。

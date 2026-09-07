@@ -14,7 +14,9 @@ from torch import Tensor, nn
 from cfmusic.conditioning.schema import ConditionBatch, build_condition_batch
 from cfmusic.distributed import (
     DistributedContext,
+    all_gather_tensor,
     decorrelate_worker_rng,
+    differentiable_all_gather,
     distributed_barrier,
     distributed_model,
     maybe_no_sync,
@@ -22,27 +24,103 @@ from cfmusic.distributed import (
 )
 from cfmusic.latent.dataset import LatentDataset
 from cfmusic.logging import MetricLogger
-from cfmusic.losses.mmd import class_conditional_mmd
+from cfmusic.losses.hsic import normalized_hsic
+from cfmusic.losses.mmd import class_conditional_mmd, cross_class_mmd
 from cfmusic.losses.roundtrip import roundtrip_loss
-from cfmusic.losses.sliced_wasserstein import class_conditional_sliced_wasserstein
+from cfmusic.losses.sliced_wasserstein import (
+    class_conditional_sliced_wasserstein,
+    cross_class_sliced_wasserstein,
+    sliced_wasserstein_standard_normal,
+)
 from cfmusic.memory import (
     autocast_context,
     peak_memory_gib,
     reset_peak_memory,
     sdpa_kernel_context,
 )
+from cfmusic.models.probes import DynamicNoiseProjector
 from cfmusic.progress import progress_bar, track
 from cfmusic.training.checkpointing import load_checkpoint, save_rolling_checkpoint
 from cfmusic.training.state import ExponentialMovingAverage, TrainState
 from cfmusic.transport.base import ConditionalTransport
+from cfmusic.transport.conditional_flow import ConditionalFlow
+
+
+def _active_labels(
+    condition: ConditionBatch, *, factorial: bool, active_axis: str | None
+) -> Tensor:
+    if not factorial:
+        return condition.style_id
+    axis = active_axis or "genre"
+    values = condition.genre_id if axis == "genre" else condition.emotion_id
+    if values is None:
+        raise ValueError(f"Factorial regularization requires {axis}_id")
+    return values
+
+
+def _balanced_condition_indices(labels: Tensor, samples_per_style: int) -> Tensor:
+    if samples_per_style <= 0:
+        raise ValueError("samples_per_style must be positive")
+    selected = []
+    for label in torch.unique(labels, sorted=True):
+        candidates = torch.nonzero(labels == label, as_tuple=False).flatten()
+        count = min(samples_per_style, len(candidates))
+        if count:
+            order = torch.randperm(len(candidates), device=labels.device)[:count]
+            selected.append(candidates.index_select(0, order))
+    if not selected:
+        raise ValueError("No samples available for conditional regularization")
+    return torch.cat(selected)
+
+
+def _unguided_predict(
+    transport: ConditionalTransport,
+    noise: Tensor,
+    condition: ConditionBatch,
+    *,
+    num_steps: int,
+    track_grad: bool,
+) -> Tensor:
+    if isinstance(transport, ConditionalFlow):
+        return transport.predict(
+            noise,
+            condition,
+            num_steps=num_steps,
+            track_grad=track_grad,
+            guidance_scale=1.0,
+            source_repulsion_scale=0.0,
+        )
+    return transport.predict(noise, condition, num_steps=num_steps, track_grad=track_grad)
+
+
+def _unguided_abduct(
+    transport: ConditionalTransport,
+    latent: Tensor,
+    condition: ConditionBatch,
+    *,
+    num_steps: int,
+    track_grad: bool,
+) -> Tensor:
+    if isinstance(transport, ConditionalFlow):
+        return transport.abduct(
+            latent,
+            condition,
+            num_steps=num_steps,
+            track_grad=track_grad,
+            guidance_scale=1.0,
+        )
+    return transport.abduct(latent, condition, num_steps=num_steps, track_grad=track_grad)
 
 
 class TransportLossModule(nn.Module):
     """Expose the transport loss through ``forward`` so native DDP owns backward hooks."""
 
-    def __init__(self, transport: nn.Module) -> None:
+    def __init__(
+        self, transport: nn.Module, noise_projector: DynamicNoiseProjector | None = None
+    ) -> None:
         super().__init__()
         self.transport = transport
+        self.noise_projector = noise_projector
 
     def forward(
         self,
@@ -58,6 +136,18 @@ class TransportLossModule(nn.Module):
         roundtrip_steps: int,
         roundtrip_samples: int | None,
         roundtrip_cosine_weight: float,
+        endpoint_weight: float,
+        endpoint_steps: int,
+        endpoint_samples_per_style: int,
+        exogeneity_hsic_weight: float,
+        exogeneity_prior_weight: float,
+        exogeneity_cross_mmd_weight: float,
+        exogeneity_cross_swd_weight: float,
+        exogeneity_steps: int,
+        exogeneity_samples_per_style: int,
+        global_step: int,
+        factorial_conditioning: bool,
+        factorial_active_axis: str | None,
     ) -> dict[str, Tensor]:
         transport = cast(ConditionalTransport, self.transport)
         losses = transport.training_loss(
@@ -77,11 +167,15 @@ class TransportLossModule(nn.Module):
             indices = torch.randperm(latent.shape[0], device=latent.device)[:count]
             factual = latent.index_select(0, indices)
             factual_condition = condition.index_select(indices)
-            noise = transport.abduct(
-                factual, factual_condition, num_steps=roundtrip_steps, track_grad=True
+            noise = _unguided_abduct(
+                transport, factual, factual_condition, num_steps=roundtrip_steps, track_grad=True
             )
-            reconstructed = transport.predict(
-                noise, factual_condition, num_steps=roundtrip_steps, track_grad=True
+            reconstructed = _unguided_predict(
+                transport,
+                noise,
+                factual_condition,
+                num_steps=roundtrip_steps,
+                track_grad=True,
             )
             consistency = roundtrip_loss(
                 reconstructed.float(), factual.float(), cosine_weight=roundtrip_cosine_weight
@@ -89,6 +183,113 @@ class TransportLossModule(nn.Module):
             losses["loss"] = losses["loss"] + roundtrip_weight * consistency
         losses["roundtrip_loss"] = consistency
         losses["roundtrip_weight"] = latent.new_tensor(roundtrip_weight)
+
+        endpoint_mmd = latent.new_zeros(())
+        endpoint_swd = latent.new_zeros(())
+        labels = _active_labels(
+            condition,
+            factorial=factorial_conditioning,
+            active_axis=factorial_active_axis,
+        )
+        if endpoint_weight > 0:
+            indices = _balanced_condition_indices(labels, endpoint_samples_per_style)
+            factual = latent.index_select(0, indices)
+            factual_condition = condition.index_select(indices)
+            endpoint_labels = labels.index_select(0, indices)
+            generated = _unguided_predict(
+                transport,
+                torch.randn_like(factual),
+                factual_condition,
+                num_steps=endpoint_steps,
+                track_grad=True,
+            )
+            flat_generated = generated.float().flatten(1)
+            flat_factual = factual.float().flatten(1)
+            endpoint_mmd = class_conditional_mmd(flat_generated, flat_factual, endpoint_labels)
+            endpoint_swd = class_conditional_sliced_wasserstein(
+                flat_generated,
+                flat_factual,
+                endpoint_labels,
+                num_projections=32,
+                seed=global_step + 101,
+            )
+            losses["loss"] = losses["loss"] + endpoint_weight * (endpoint_mmd + endpoint_swd)
+        losses["endpoint_mmd"] = endpoint_mmd
+        losses["endpoint_swd"] = endpoint_swd
+        losses["endpoint_weight"] = latent.new_tensor(endpoint_weight)
+
+        noise_hsic = latent.new_zeros(())
+        noise_prior = latent.new_zeros(())
+        noise_cross_mmd = latent.new_zeros(())
+        noise_cross_swd = latent.new_zeros(())
+        exogeneity_active = any(
+            weight > 0
+            for weight in (
+                exogeneity_hsic_weight,
+                exogeneity_prior_weight,
+                exogeneity_cross_mmd_weight,
+                exogeneity_cross_swd_weight,
+            )
+        )
+        if exogeneity_active:
+            if self.noise_projector is None:
+                raise ValueError("Exogeneity loss requires a dynamic noise projector")
+            indices = _balanced_condition_indices(labels, exogeneity_samples_per_style)
+            factual = latent.index_select(0, indices)
+            factual_condition = condition.index_select(indices)
+            noise_labels = labels.index_select(0, indices)
+            noise = _unguided_abduct(
+                transport,
+                factual,
+                factual_condition,
+                num_steps=exogeneity_steps,
+                track_grad=True,
+            )
+            views = self.noise_projector(noise, step=global_step)
+            global_labels = all_gather_tensor(noise_labels)
+            global_views = tuple(differentiable_all_gather(view) for view in views)
+            noise_hsic = torch.stack(
+                [normalized_hsic(view, global_labels) for view in global_views]
+            ).mean()
+            noise_cross_mmd = torch.stack(
+                [cross_class_mmd(view, global_labels) for view in global_views]
+            ).mean()
+            noise_cross_swd = torch.stack(
+                [
+                    cross_class_sliced_wasserstein(
+                        view,
+                        global_labels,
+                        num_projections=32,
+                        seed=global_step * 131 + view_index,
+                    )
+                    for view_index, view in enumerate(global_views)
+                ]
+            ).mean()
+            gaussian_views = (
+                *global_views[: self.noise_projector.num_views],
+                global_views[-1],
+            )
+            noise_prior = torch.stack(
+                [
+                    sliced_wasserstein_standard_normal(
+                        view,
+                        num_projections=32,
+                        seed=global_step * 137 + view_index,
+                    )
+                    for view_index, view in enumerate(gaussian_views)
+                ]
+            ).mean()
+            losses["loss"] = losses["loss"] + (
+                exogeneity_hsic_weight * noise_hsic
+                + exogeneity_prior_weight * noise_prior
+                + exogeneity_cross_mmd_weight * noise_cross_mmd
+                + exogeneity_cross_swd_weight * noise_cross_swd
+            )
+        losses["noise_hsic"] = noise_hsic
+        losses["noise_prior_swd"] = noise_prior
+        losses["noise_cross_class_mmd"] = noise_cross_mmd
+        losses["noise_cross_class_swd"] = noise_cross_swd
+        losses["exogeneity_active"] = latent.new_tensor(float(exogeneity_active))
         return losses
 
 
@@ -202,6 +403,23 @@ def roundtrip_schedule_scale(step: int, *, warmup_steps: int, ramp_steps: int) -
     if ramp_steps == 0:
         return 1.0
     return min(1.0, (step - warmup_steps + 1) / ramp_steps)
+
+
+def sparse_regularizer_scale(
+    step: int,
+    *,
+    warmup_steps: int,
+    ramp_steps: int,
+    interval: int,
+    offset: int,
+) -> float:
+    """Return a ramped scale only on one offset of a sparse interval."""
+
+    if interval <= 0 or not 0 <= offset < interval:
+        raise ValueError("Sparse regularizer offset must be within its positive interval")
+    if step < warmup_steps or (step - warmup_steps) % interval != offset:
+        return 0.0
+    return roundtrip_schedule_scale(step, warmup_steps=warmup_steps, ramp_steps=ramp_steps)
 
 
 def inverse_frequency_weights(labels: Sequence[int], *, exponent: float) -> dict[int, float]:
@@ -466,9 +684,28 @@ def train_transport_steps(
     roundtrip_warmup_steps: int = 0,
     roundtrip_ramp_steps: int = 0,
     roundtrip_interval: int = 1,
+    roundtrip_offset: int = 0,
     roundtrip_inverse_steps: int = 2,
     roundtrip_samples_per_batch: int | None = None,
     roundtrip_cosine_weight: float = 0.1,
+    endpoint_weight: float = 0.0,
+    endpoint_warmup_steps: int = 0,
+    endpoint_ramp_steps: int = 0,
+    endpoint_interval: int = 1,
+    endpoint_offset: int = 0,
+    endpoint_solver_steps: int = 4,
+    endpoint_samples_per_style: int = 4,
+    exogeneity_hsic_weight: float = 0.0,
+    exogeneity_prior_weight: float = 0.0,
+    exogeneity_cross_mmd_weight: float = 0.0,
+    exogeneity_cross_swd_weight: float = 0.0,
+    exogeneity_warmup_steps: int = 0,
+    exogeneity_ramp_steps: int = 0,
+    exogeneity_interval: int = 1,
+    exogeneity_offset: int = 0,
+    exogeneity_inverse_steps: int = 4,
+    exogeneity_samples_per_style: int = 4,
+    noise_projector: DynamicNoiseProjector | None = None,
     resume_from: Path | None = None,
     distributed: DistributedContext | None = None,
 ) -> TrainState:
@@ -486,8 +723,38 @@ def train_transport_steps(
         raise ValueError("Round-trip weights must be non-negative")
     if roundtrip_interval <= 0 or roundtrip_inverse_steps <= 0:
         raise ValueError("Round-trip interval and inverse steps must be positive")
+    if not 0 <= roundtrip_offset < roundtrip_interval:
+        raise ValueError("Round-trip offset must be within its interval")
     if roundtrip_samples_per_batch is not None and roundtrip_samples_per_batch <= 0:
         raise ValueError("roundtrip_samples_per_batch must be positive or null")
+    if endpoint_weight < 0 or endpoint_solver_steps <= 0 or endpoint_samples_per_style <= 0:
+        raise ValueError("Endpoint matching weight/steps/samples are invalid")
+    if any(
+        value < 0
+        for value in (
+            exogeneity_hsic_weight,
+            exogeneity_prior_weight,
+            exogeneity_cross_mmd_weight,
+            exogeneity_cross_swd_weight,
+        )
+    ):
+        raise ValueError("Exogeneity weights must be non-negative")
+    if exogeneity_inverse_steps <= 0 or exogeneity_samples_per_style <= 0:
+        raise ValueError("Exogeneity inverse steps and samples must be positive")
+    sparse_regularizer_scale(
+        0,
+        warmup_steps=endpoint_warmup_steps,
+        ramp_steps=endpoint_ramp_steps,
+        interval=endpoint_interval,
+        offset=endpoint_offset,
+    )
+    sparse_regularizer_scale(
+        0,
+        warmup_steps=exogeneity_warmup_steps,
+        ramp_steps=exogeneity_ramp_steps,
+        interval=exogeneity_interval,
+        offset=exogeneity_offset,
+    )
     context = distributed or DistributedContext(0, 0, 1, device)
     state = TrainState()
     ema = ExponentialMovingAverage(transport, ema_decay) if ema_decay else None
@@ -513,7 +780,7 @@ def train_transport_steps(
             )
         state.batch_in_epoch = 0
     state.world_size = context.world_size
-    loss_module = TransportLossModule(transport)
+    loss_module = TransportLossModule(transport, noise_projector)
     training_model = distributed_model(
         loss_module, context, find_unused_parameters=find_unused_parameters
     )
@@ -539,6 +806,19 @@ def train_transport_steps(
     report_roundtrip = torch.zeros((), device=device)
     report_roundtrip_weight = 0.0
     report_roundtrip_steps = 0
+    report_endpoint = {
+        "endpoint_mmd": torch.zeros((), device=device),
+        "endpoint_swd": torch.zeros((), device=device),
+    }
+    report_endpoint_weight = 0.0
+    report_endpoint_steps = 0
+    report_exogeneity = {
+        "noise_hsic": torch.zeros((), device=device),
+        "noise_prior_swd": torch.zeros((), device=device),
+        "noise_cross_class_mmd": torch.zeros((), device=device),
+        "noise_cross_class_swd": torch.zeros((), device=device),
+    }
+    report_exogeneity_steps = 0
     while state.global_step < max_steps:
         set_data_epoch(batches, state.epoch)
         saw_batch = False
@@ -565,22 +845,41 @@ def train_transport_steps(
                 if condition_contrast_weight > 0 and condition_vocabularies is not None
                 else None
             )
+            batch_sample_weight = batch.get("sample_weight")
             sample_weight = (
-                style_weight_lookup[condition.style_id]
-                if style_weight_lookup is not None and not factorial_conditioning
+                batch_sample_weight.to(device, non_blocking=True).flatten()
+                if isinstance(batch_sample_weight, Tensor)
                 else None
             )
-            roundtrip_scale = roundtrip_schedule_scale(
+            if style_weight_lookup is not None and not factorial_conditioning:
+                style_weight = style_weight_lookup[condition.style_id]
+                sample_weight = (
+                    style_weight if sample_weight is None else sample_weight * style_weight
+                )
+            roundtrip_scale = sparse_regularizer_scale(
                 state.global_step,
                 warmup_steps=roundtrip_warmup_steps,
                 ramp_steps=roundtrip_ramp_steps,
+                interval=roundtrip_interval,
+                offset=roundtrip_offset,
             )
-            run_roundtrip = (
-                roundtrip_weight > 0
-                and roundtrip_scale > 0
-                and (state.global_step - roundtrip_warmup_steps) % roundtrip_interval == 0
-            )
+            run_roundtrip = roundtrip_weight > 0 and roundtrip_scale > 0
             active_roundtrip_weight = roundtrip_weight * roundtrip_scale if run_roundtrip else 0.0
+            endpoint_scale = sparse_regularizer_scale(
+                state.global_step,
+                warmup_steps=endpoint_warmup_steps,
+                ramp_steps=endpoint_ramp_steps,
+                interval=endpoint_interval,
+                offset=endpoint_offset,
+            )
+            active_endpoint_weight = endpoint_weight * endpoint_scale
+            exogeneity_scale = sparse_regularizer_scale(
+                state.global_step,
+                warmup_steps=exogeneity_warmup_steps,
+                ramp_steps=exogeneity_ramp_steps,
+                interval=exogeneity_interval,
+                offset=exogeneity_offset,
+            )
             report_samples += latent.shape[0]
             last_batch = batch_count is not None and batch_index + 1 == batch_count
             synchronize = (batch_index + 1) % gradient_accumulation == 0 or last_batch
@@ -601,6 +900,18 @@ def train_transport_steps(
                         roundtrip_steps=roundtrip_inverse_steps,
                         roundtrip_samples=roundtrip_samples_per_batch,
                         roundtrip_cosine_weight=roundtrip_cosine_weight,
+                        endpoint_weight=active_endpoint_weight,
+                        endpoint_steps=endpoint_solver_steps,
+                        endpoint_samples_per_style=endpoint_samples_per_style,
+                        exogeneity_hsic_weight=exogeneity_hsic_weight * exogeneity_scale,
+                        exogeneity_prior_weight=exogeneity_prior_weight * exogeneity_scale,
+                        exogeneity_cross_mmd_weight=exogeneity_cross_mmd_weight * exogeneity_scale,
+                        exogeneity_cross_swd_weight=exogeneity_cross_swd_weight * exogeneity_scale,
+                        exogeneity_steps=exogeneity_inverse_steps,
+                        exogeneity_samples_per_style=exogeneity_samples_per_style,
+                        global_step=state.global_step,
+                        factorial_conditioning=factorial_conditioning,
+                        factorial_active_axis=factorial_active_axis,
                     )
                     loss = losses["loss"] / gradient_accumulation
                 scaler.scale(loss).backward()
@@ -629,6 +940,23 @@ def train_transport_steps(
                 report_roundtrip += losses["roundtrip_loss"].detach()
                 report_roundtrip_weight += active_roundtrip_weight
                 report_roundtrip_steps += 1
+            if active_endpoint_weight > 0:
+                for name in report_endpoint:
+                    report_endpoint[name] += losses[name].detach()
+                report_endpoint_weight += active_endpoint_weight
+                report_endpoint_steps += 1
+            if exogeneity_scale > 0 and any(
+                value > 0
+                for value in (
+                    exogeneity_hsic_weight,
+                    exogeneity_prior_weight,
+                    exogeneity_cross_mmd_weight,
+                    exogeneity_cross_swd_weight,
+                )
+            ):
+                for name in report_exogeneity:
+                    report_exogeneity[name] += losses[name].detach()
+                report_exogeneity_steps += 1
             progress.update(1)
             report = (
                 state.global_step == 1
@@ -654,6 +982,13 @@ def train_transport_steps(
                     1, report_roundtrip_steps
                 )
                 metrics["roundtrip_active_fraction"] = report_roundtrip_steps / report_steps
+                for name, value in report_endpoint.items():
+                    metrics[name] = float(value / max(1, report_endpoint_steps))
+                metrics["endpoint_weight"] = report_endpoint_weight / max(1, report_endpoint_steps)
+                metrics["endpoint_active_fraction"] = report_endpoint_steps / report_steps
+                for name, value in report_exogeneity.items():
+                    metrics[name] = float(value / max(1, report_exogeneity_steps))
+                metrics["exogeneity_active_fraction"] = report_exogeneity_steps / report_steps
                 if (
                     context.is_main
                     and validation_batch is not None
@@ -698,6 +1033,13 @@ def train_transport_steps(
                 report_roundtrip.zero_()
                 report_roundtrip_weight = 0.0
                 report_roundtrip_steps = 0
+                for value in report_endpoint.values():
+                    value.zero_()
+                report_endpoint_weight = 0.0
+                report_endpoint_steps = 0
+                for value in report_exogeneity.values():
+                    value.zero_()
+                report_exogeneity_steps = 0
             if state.global_step % checkpoint_interval == 0 or state.global_step == max_steps:
                 if context.is_main:
                     save_rolling_checkpoint(

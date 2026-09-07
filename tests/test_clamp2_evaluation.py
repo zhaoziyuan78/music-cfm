@@ -23,6 +23,20 @@ def test_clamp2_style_prompt_and_similarity_metrics() -> None:
     assert metrics["clamp2_target_minus_source"] == 1.0
 
 
+def test_clamp2_logit_bias_changes_only_calibrated_decision() -> None:
+    metrics = clamp2_style_metrics(
+        np.array([0.6, 0.5]),
+        style_embeddings=[np.array([1.0, 0.0]), np.array([0.0, 1.0])],
+        source_style_id=0,
+        target_style_id=1,
+        logit_bias=[0.0, 0.2],
+    )
+
+    assert metrics["clamp2_target_similarity"] == 0.5
+    assert metrics["clamp2_target_style_success"] == 1.0
+    assert np.isclose(metrics["clamp2_calibrated_target_minus_source"], 0.1)
+
+
 def test_midi_to_mtf_writes_clamp2_performance_format(tmp_path: Path) -> None:
     midi_path = tmp_path / "piece.mid"
     mtf_path = tmp_path / "piece.mtf"

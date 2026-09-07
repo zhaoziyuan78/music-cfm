@@ -73,6 +73,7 @@ def test_latent_label_overlay_reuses_tensors_and_changes_condition_ids(tmp_path:
     overlay = pd.read_parquet(tmp_path / "index.parquet")
     overlay["style_id"] = [1, 1, 0, 0]
     overlay["genre_id"] = overlay["style_id"]
+    overlay["label_confidence_weight"] = [0.6, 0.7, 0.8, 0.9]
     overlay.to_parquet(overlay_path, index=False)
     overlay_path.with_suffix(".metadata.json").write_text(
         json.dumps(
@@ -92,6 +93,7 @@ def test_latent_label_overlay_reuses_tensors_and_changes_condition_ids(tmp_path:
 
     assert original[0]["style_id"] == 0
     assert relabeled[0]["style_id"] == 1
+    torch.testing.assert_close(relabeled[0]["sample_weight"], torch.tensor(0.6))
     torch.testing.assert_close(original[0]["latent"], relabeled[0]["latent"])
     assert relabeled.metadata["label_assignment_hash"] == "assignment"
 
